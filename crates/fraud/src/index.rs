@@ -85,11 +85,31 @@ impl Index {
             bail!("unsupported dimension count {dims}");
         }
 
-        match version {
-            EXACT_VERSION => Self::open_exact(mmap),
-            IVF_VERSION => Self::open_ivf(mmap),
+        prefault_pages(&mmap);
+
+        let index = match version {
+            EXACT_VERSION => Self::open_exact(mmap)?,
+            IVF_VERSION => Self::open_ivf(mmap)?,
             other => bail!("unsupported index version {other}"),
+        };
+        index.warmup();
+        Ok(index)
+    }
+
+    fn warmup(&self) {
+        let mut state: u32 = 0x12345678;
+        let mut sink: f32 = 0.0;
+        for _ in 0..512 {
+            let mut query = [0.0f32; DIMS];
+            for value in query.iter_mut() {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                *value = (state >> 8) as f32 / (1u32 << 24) as f32;
+            }
+            if let SearchResult::Score(score) = self.fraud_score(&query, None) {
+                sink += score;
+            }
         }
+        std::hint::black_box(sink);
     }
 
     pub fn len(&self) -> usize {
@@ -661,4 +681,19 @@ pub fn encode_record(vector: &Vector, label: &str) -> Result<[u8; EXACT_RECORD_L
         other => return Err(anyhow!("unknown label {other}")),
     };
     Ok(record)
+}
+
+fn prefault_pages(mmap: &Mmap) {
+    let bytes = &mmap[..];
+    let page = 4096usize;
+    let mut acc: u8 = 0;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        acc ^= bytes[offset];
+        offset += page;
+    }
+    if !bytes.is_empty() {
+        acc ^= bytes[bytes.len() - 1];
+    }
+    std::hint::black_box(acc);
 }
