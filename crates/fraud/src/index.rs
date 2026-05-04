@@ -54,6 +54,7 @@ struct IvfIndex {
     count: usize,
     cluster_count: usize,
     nprobe: usize,
+    full_nprobe: usize,
     repair: bool,
     centroids_offset: usize,
     offsets_offset: usize,
@@ -151,6 +152,8 @@ impl Index {
         }
 
         let nprobe = env_usize("IVF_NPROBE", 1).clamp(1, cluster_count.min(MAX_IVF_NPROBE));
+        let full_nprobe =
+            env_usize("IVF_FULL_NPROBE", nprobe).clamp(nprobe, cluster_count.min(MAX_IVF_NPROBE));
         let repair = env_bool("IVF_REPAIR", false);
         Ok(Self {
             inner: IndexInner::Ivf(IvfIndex {
@@ -158,6 +161,7 @@ impl Index {
                 count,
                 cluster_count,
                 nprobe,
+                full_nprobe,
                 repair,
                 centroids_offset,
                 offsets_offset,
@@ -309,12 +313,13 @@ impl IvfIndex {
         let mut cluster_dist = [f32::INFINITY; MAX_IVF_NPROBE];
         let mut cluster_ids = [0usize; MAX_IVF_NPROBE];
 
+        let max_probes = self.full_nprobe;
         for cluster_id in 0..self.cluster_count {
             let dist = self.centroid_distance(vector, cluster_id);
             insert_best_cluster(
                 dist,
                 cluster_id,
-                self.nprobe,
+                max_probes,
                 &mut cluster_dist,
                 &mut cluster_ids,
             );
@@ -332,6 +337,25 @@ impl IvfIndex {
                 deadline,
             ) {
                 return SearchResult::TimedOut;
+            }
+        }
+
+        if max_probes > self.nprobe {
+            let frauds = fraud_count(&best_label);
+            if frauds == 2 || frauds == 3 {
+                for &cluster_id in &cluster_ids[self.nprobe..max_probes] {
+                    visited[cluster_id] = true;
+                    if self.scan_cluster(
+                        cluster_id,
+                        &query,
+                        &mut best_dist,
+                        &mut best_label,
+                        started_at,
+                        deadline,
+                    ) {
+                        return SearchResult::Score(score_from_labels(self.count, &best_label));
+                    }
+                }
             }
         }
 
@@ -434,6 +458,11 @@ fn score_from_labels(count: usize, best_label: &[u8; K]) -> f32 {
         .filter(|label| **label == 1)
         .count();
     frauds as f32 / K as f32
+}
+
+#[inline]
+fn fraud_count(best_label: &[u8; K]) -> usize {
+    best_label.iter().filter(|label| **label == 1).count()
 }
 
 #[inline]

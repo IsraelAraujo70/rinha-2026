@@ -3,18 +3,21 @@ use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use axum::{
     body::Bytes,
     extract::State,
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use fraud::{
     index::{Index, SearchResult},
     payload::FraudRequest,
     vector::vectorize,
 };
-use serde::Serialize;
+use mimalloc::MiMalloc;
 use tracing::{error, info, warn};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Clone)]
 struct AppState {
@@ -24,11 +27,15 @@ struct AppState {
 
 const DEFAULT_KNN_TIMEOUT_US: u64 = 1_000;
 
-#[derive(Serialize)]
-struct FraudResponse {
-    approved: bool,
-    fraud_score: f32,
-}
+const FRAUD_RESPONSES: [&[u8]; 6] = [
+    b"{\"approved\":true,\"fraud_score\":0.0}",
+    b"{\"approved\":true,\"fraud_score\":0.2}",
+    b"{\"approved\":true,\"fraud_score\":0.4}",
+    b"{\"approved\":false,\"fraud_score\":0.6}",
+    b"{\"approved\":false,\"fraud_score\":0.8}",
+    b"{\"approved\":false,\"fraud_score\":1.0}",
+];
+const FRAUD_FALLBACK: &[u8] = FRAUD_RESPONSES[0];
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -80,46 +87,45 @@ async fn ready() -> impl IntoResponse {
     StatusCode::NO_CONTENT
 }
 
-async fn fraud_score(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
+async fn fraud_score(State(state): State<AppState>, body: Bytes) -> Response {
     let request = match serde_json::from_slice::<FraudRequest>(&body) {
         Ok(request) => request,
         Err(err) => {
             error!(error = %err, "invalid payload; using approve fallback");
-            return Json(fallback_response());
+            return json_response(FRAUD_FALLBACK);
         }
     };
 
-    let response = match std::panic::catch_unwind(|| score_request(&state, &request)) {
-        Ok(response) => response,
+    let body = match std::panic::catch_unwind(|| score_request(&state, &request)) {
+        Ok(bytes) => bytes,
         Err(_) => {
             error!(id = %request.id, "panic while scoring request; using approve fallback");
-            fallback_response()
+            FRAUD_FALLBACK
         }
     };
-    Json(response)
+    json_response(body)
 }
 
-fn score_request(state: &AppState, request: &FraudRequest) -> FraudResponse {
+fn score_request(state: &AppState, request: &FraudRequest) -> &'static [u8] {
     let vector = vectorize(request);
     let fraud_score = match state.index.fraud_score(&vector, Some(state.knn_timeout)) {
         SearchResult::Score(score) => score,
         SearchResult::TimedOut => {
             warn!(id = %request.id, "knn timed out; using approve fallback");
-            0.0
+            return FRAUD_FALLBACK;
         }
     };
 
-    FraudResponse {
-        approved: fraud_score < 0.6,
-        fraud_score,
-    }
+    let count = (fraud_score * 5.0).round() as usize;
+    FRAUD_RESPONSES[count.min(5)]
 }
 
-fn fallback_response() -> FraudResponse {
-    FraudResponse {
-        approved: true,
-        fraud_score: 0.0,
-    }
+fn json_response(body: &'static [u8]) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(Bytes::from_static(body)))
+        .expect("static response always builds")
 }
 
 async fn shutdown_signal() {
