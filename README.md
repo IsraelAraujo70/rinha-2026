@@ -21,9 +21,10 @@ A implementação é em Rust, sem banco de dados externo. Todo o pré-processame
 cliente
    │  porta 9999
    ▼
-┌──────────────┐  0.20 CPU / 20 MB
-│   nginx LB   │  round-robin, keepalive 256
+┌──────────────┐  0.20 CPU / 30 MB
+│  HAProxy LB  │  HTTP keep-alive + http-reuse
 └─────┬────┬───┘
+      │    │  Unix domain sockets
       │    │
       ▼    ▼
 ┌─────────┐ ┌─────────┐  0.40 CPU / 160 MB cada
@@ -37,7 +38,7 @@ cliente
    └────────────────┘
 ```
 
-Total: **1.0 CPU + 340 MB** dentro do limite oficial de 1 CPU / 350 MB.
+Total: **1.0 CPU + 350 MB** dentro do limite oficial de 1 CPU / 350 MB.
 
 ## Pipeline da requisição
 
@@ -116,12 +117,12 @@ Em ordem cronológica de impacto medido:
 - Tokio em `current_thread` runtime (cada réplica tem 0.40 vCPU; work-stealing seria desperdício).
 - mimalloc como global allocator.
 
-### nginx
+### HAProxy + Unix domain sockets
 
-- **0.20 vCPU** (não 0.10) — o LB precisa de espaço pra processar 900 req/s sem virar gargalo. Foi a maior alavanca individual de p99.
-- `keepalive 256` no upstream, `keepalive_requests 100000`.
-- `proxy_buffering off`, `proxy_request_buffering off`.
-- `tcp_nodelay`, `multi_accept`, `epoll`.
+- HAProxy 3.3 como load balancer em `0.20` CPU / `30MB`.
+- APIs escutam em Unix domain sockets (`/sockets/api1.sock`, `/sockets/api2.sock`) compartilhados por volume Docker.
+- `mode http`, `option http-keep-alive` e `http-reuse always` para reaproveitar conexões upstream.
+- `ulimit nofile=65535` para LB e APIs.
 
 ### Caminho de requisição
 
@@ -159,8 +160,8 @@ crates/fraud/src/
 Outros arquivos:
 
 - `Dockerfile` — multi-stage: builder Rust → data stage que baixa references e roda `build_index` → imagem final com binário + `data.bin`.
-- `nginx.conf` — load balancer.
-- `docker-compose.yml` — duas réplicas + nginx, limites de recurso.
+- `haproxy.cfg` — load balancer HTTP com upstream em Unix sockets.
+- `docker-compose.yml` — duas réplicas + HAProxy, limites de recurso.
 - `.cargo/config.toml` — flags de compilação por target.
 
 ## Configuração via variáveis de ambiente
@@ -168,6 +169,7 @@ Outros arquivos:
 | Variável | Default | Descrição |
 |---|---|---|
 | `API_ADDR` | `0.0.0.0:8080` | Endereço do servidor HTTP |
+| `SOCKET_PATH` | vazio | Se definido, a API escuta em Unix socket em vez de TCP |
 | `INDEX_PATH` | `/index/data.bin` | Caminho do índice IVF |
 | `KNN_TIMEOUT_US` | 1000 (build), **3000 no compose** | Timeout da busca k-NN |
 | `IVF_NPROBE` | 1 (build), **8 no compose** | Clusters escaneados na fase rápida |
@@ -201,9 +203,12 @@ Local em host de bancada com outros processos competindo por CPU; oficial no Mac
 | Wave 2a (mesmo commit, primeira prévia) | **Mac Mini** | 1 | 2819 | 105.50 ms | 3796.15 |
 | `.cargo/config.toml` no Dockerfile | **Mac Mini** | 1 | 2819 | 112.86 ms | 3766.85 |
 | Warmup do mmap + KNN no startup | **Mac Mini** | 0 | 3000 | 113.83 ms | 3943.74 |
-| **CPU split (nginx 0.20, api 0.40 cada) + AVX2 IVF** | **Mac Mini** | **0** | **3000** | **7.32 ms** | **5135.33** |
+| CPU split nginx/API + AVX2 IVF | **Mac Mini** | 0 | 3000 | 7.32 ms | 5135.33 |
+| nginx stream + Unix sockets | local | 0 | 3000 | 3.46 ms | 5460.78 |
+| HAProxy TCP + Unix sockets | local | 0 | 3000 | 3.41 ms | 5466.84 |
+| **HAProxy HTTP reuse + Unix sockets** | local | **0** | **3000** | **3.14 ms** | **5503.33** |
 
-(*) Local com host saturado.
+(*) Medição antiga com host de bancada saturado.
 
 ## Como executar localmente
 
@@ -250,7 +255,7 @@ jq . /tmp/rinha/test/results.json
 | Datas | chrono |
 | Memória do índice | memmap2 |
 | Decompressão (build) | flate2 |
-| Load balancer | nginx 1.27 |
+| Load balancer | HAProxy 3.3 |
 | Container | Docker / docker-compose |
 | Compilação | rustc 1.x com `target-cpu=x86-64-v3`, LTO fat |
 
@@ -258,26 +263,28 @@ jq . /tmp/rinha/test/results.json
 
 Anotações honestas do que mexeu o ponteiro e o que não mexeu, em ordem de aprendizado:
 
-1. **Detecção e latência são problemas separados.** A gente tratou como se um arrastasse o outro, mas no fim cada um tem alavancas próprias. Detecção saturou cedo (Wave 2a, K=4096 + k-means++), latência foi outra história.
+1. **Detecção e latência são problemas separados.** Detecção saturou cedo com K=4096 + k-means++ + 25 iterações; latência exigiu mexer no caminho HTTP/LB.
 
-2. **Ambiente local engana.** Bench local mostrava p99 de KNN em ~80–100 us e a gente estimou p99 HTTP de 1–2 ms na máquina da Rinha. Realidade da primeira prévia oficial: 105 ms. Diferença 50× entre cenário previsto e cenário real.
+2. **O ambiente local engana.** Bench local de KNN em dezenas de microssegundos não prevê sozinho o p99 HTTP no Mac Mini. A primeira prévia oficial mostrou que fila no load balancer podia dominar tudo.
 
-3. **A culpada era a alocação de CPU do nginx.** Subir `cpus: "0.10"` para `"0.20"` (compensando com 0.05 a menos em cada réplica de API) derrubou o p99 oficial de 113 ms para 7.32 ms. **15× de melhoria com três caracteres trocados.** O nginx é o único processo que toca cada requisição duas vezes (entrada + saída), então é o gargalo natural quando o teto de CPU está apertado. As otimizações da API estavam todas sendo mascaradas por fila no LB.
+3. **CPU no load balancer importou, mas só até certo ponto.** Subir nginx de `0.10` para `0.20` CPU derrubou o p99 oficial de ~113 ms para 7.32 ms. Depois disso, tirar CPU das APIs para dar `0.25` ao LB regrediu no teste local.
 
-4. **Dois experimentos parecidos com promessa de muita coisa deram quase nada no Mac Mini:**
-   - Adicionar `target-cpu=x86-64-v3` ao Dockerfile (que faltava no `.cargo/config.toml` copiado no contexto): `± 7 ms` no p99, dentro do ruído.
-   - Pre-faultar o mmap de 93 MB e rodar 512 queries de aquecimento no startup: corrigiu o último FN borderline (efeito real em detecção), mas não moveu o p99. A SSD do Mac Mini não era o gargalo.
+4. **Unix domain sockets foram a próxima alavanca real.** Trocar upstream TCP por UDS reduziu o p99 local para a faixa de 3 ms mantendo detecção perfeita.
 
-5. **AVX2 explícito na distância IVF i16 valeu a pena.** Trocar o loop escalar de 14 dims por um único `_mm256_madd_epi16` com máscara: bench KNN p99 de 105 us para 83 us. Sozinho não fechava a conta, mas combinado com o split de CPU foi um ganho real.
+5. **HAProxy HTTP com `http-reuse always` ganhou do nginx stream e do HAProxy TCP.** Melhor rodada local: 3.14 ms p99, `det_score=3000`, score 5503.33.
 
-6. **k-means++ + 25 iterações + K=4096 zerou os erros.** A combinação dos três é necessária — só aumentar K sem k-means++ ou sem mais iterações degrada porque centróides ruins espalham mal os pontos.
+6. **AVX2 explícito na distância IVF i16 valeu a pena.** Trocar o loop escalar de 14 dims por `_mm256_madd_epi16` reduziu o p99 do KNN isolado de ~105 us para ~83 us.
 
-7. **Adaptive nprobe (8 → 24 nos casos borderline)** é o que deixa pagar pouco no caso médio sem perder recall nos difíceis. Casos confiantes (0/1 ou 4/5 fraudes nos top-K) saem em uma única rodada de probes.
+7. **k-means++ + 25 iterações + K=4096 zerou os erros no preview.** Só aumentar K sem bons centróides não basta.
 
-8. **Trabalho que pareceu boa ideia e regrediu / ficou neutro:**
+8. **Adaptive nprobe (8 -> 24 nos borderline)** deixa pagar pouco no caso médio sem perder recall nos difíceis.
+
+9. **Trabalho que pareceu boa ideia e regrediu / ficou neutro:**
    - Substituir axum por bare hyper: neutro em 5 runs locais. O overhead do axum não estava custando o suficiente para justificar a complexidade extra.
    - Parser JSON com `&str` borrowed + datetime manual: regrediu localmente. Hipótese é que o serde_json valida ausência de escapes para fazer o borrow zero-copy, e essa validação custa mais do que economiza num payload pequeno típico. Pode ser que valha em parser totalmente manual com `memchr` (jairoblatt faz isso), mas a versão híbrida não compensou.
+   - Servidor HTTP manual em Tokio sobre UDS: piorou no k6 local (`5.03 ms` p99) contra Axum/Hyper sobre UDS, então foi descartado.
+   - Mais CPU para o load balancer (`0.25/0.375/0.375`): piorou bastante no host local; as APIs ainda precisam dos `0.40` por réplica.
 
-9. **A diferença entre 5135 e 6000.** O teto absoluto da Rinha é p99 ≤ 1 ms para zerar `p99_score` em 3000. Estamos em 7.32 ms (p99_score 2135), com detecção já no máximo. Os 865 pontos restantes só sairiam de cortar mais 6 ms do caminho HTTP — provavelmente combinando parser manual + UDS entre nginx e API.
+10. **A diferença até 6000.** O teto absoluto da Rinha é p99 <= 1 ms para zerar `p99_score` em 3000. Com detecção no máximo, os pontos restantes dependem só de cortar caminho HTTP/runtime.
 
 Detalhes commit a commit em `git log`; cada onda saiu como commit separado com motivação e número.

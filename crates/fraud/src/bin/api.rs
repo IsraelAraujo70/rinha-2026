@@ -1,4 +1,6 @@
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    env, net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration,
+};
 
 use axum::{
     body::Bytes,
@@ -58,13 +60,27 @@ async fn main() -> anyhow::Result<()> {
         .route("/fraud-score", post(fraud_score))
         .with_state(state);
 
+    serve(app).await
+}
+
+async fn serve(app: Router) -> anyhow::Result<()> {
+    if let Some(socket_path) = env::var_os("SOCKET_PATH").map(PathBuf::from) {
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))?;
+        info!(path = %socket_path.display(), "api listening on unix socket");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+        return Ok(());
+    }
+
     let addr: SocketAddr = env::var("API_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
         .parse()?;
-    serve(addr, app).await
-}
-
-async fn serve(addr: SocketAddr, app: Router) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "api listening");
     axum::serve(listener, app)
@@ -100,17 +116,24 @@ async fn fraud_score(State(state): State<AppState>, body: Bytes) -> Response {
 }
 
 fn score_request(state: &AppState, request: &FraudRequest) -> &'static [u8] {
+    match score_count(state, request) {
+        Some(count) => FRAUD_RESPONSES[count],
+        None => FRAUD_FALLBACK,
+    }
+}
+
+fn score_count(state: &AppState, request: &FraudRequest) -> Option<usize> {
     let vector = vectorize(request);
     let fraud_score = match state.index.fraud_score(&vector, Some(state.knn_timeout)) {
         SearchResult::Score(score) => score,
         SearchResult::TimedOut => {
             warn!(id = %request.id, "knn timed out; using approve fallback");
-            return FRAUD_FALLBACK;
+            return None;
         }
     };
 
     let count = (fraud_score * 5.0).round() as usize;
-    FRAUD_RESPONSES[count.min(5)]
+    Some(count.min(5))
 }
 
 fn json_response(body: &'static [u8]) -> Response {
