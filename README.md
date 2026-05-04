@@ -10,12 +10,12 @@ A implementação é em Rust, sem banco de dados externo. Todo o pré-processame
 cliente
    │  porta 9999
    ▼
-┌──────────────┐  0.10 CPU / 20 MB
+┌──────────────┐  0.20 CPU / 20 MB
 │   nginx LB   │  round-robin, keepalive 256
 └─────┬────┬───┘
       │    │
       ▼    ▼
-┌─────────┐ ┌─────────┐  0.45 CPU / 160 MB cada
+┌─────────┐ ┌─────────┐  0.40 CPU / 160 MB cada
 │  api1   │ │  api2   │  Rust + axum + hyper
 └────┬────┘ └────┬────┘
      │           │
@@ -115,7 +115,6 @@ Em ordem cronológica de impacto medido:
 
 - Resposta como uma de 6 `&'static [u8]` pré-construídas — sem `ryu`, sem serde, sem alocação.
 - Timeout interno de KNN em 3 ms; em caso de timeout, retorna `{"approved": true, "fraud_score": 0.0}` em HTTP 200. Evita o peso 5× de `Err` no `score_det`.
-- `catch_unwind` ao redor do scoring — pânico vira fallback approved, nunca um HTTP 500.
 
 ### Build do índice
 
@@ -167,7 +166,8 @@ Outros arquivos:
 | Configuração | avg | p99 |
 |---|---|---|
 | K=256, nprobe=1 (legado) | 82 us | 249 us |
-| K=4096, nprobe=8 / full=24 (atual) | 55 us | 102 us |
+| K=4096, nprobe=8 / full=24 (pré-SIMD IVF) | 56 us | 105 us |
+| K=4096, nprobe=8 / full=24 (atual, AVX2 IVF) | 50 us | 83 us |
 
 ### Teste oficial k6 (dataset de 54.100 payloads, 900 req/s)
 
@@ -180,8 +180,9 @@ Todas as medições com host de bancada poluído por outros processos — númer
 | Wave C (cargo profile + nginx + tokio) | 38 | 2286 | 3.09 ms | 4796.17 |
 | Wave 1 (static resp + mimalloc + adaptive nprobe) | 8 | 2630 | 4.61 ms | 4967.01 |
 | **Wave 2a (K=4096 k-means++ 25 iters)** | **0** | **3000** (max) | 10.68 ms (*) | **4971** |
+| CPU split nginx/API + AVX2 IVF | 0 | 3000 | 3.97 ms | 5401.37 |
 
-(*) Com host de bancada saturado por outros processos. Bench KNN puro continua 102us p99 → estimativa contest-clean: p99 HTTP entre 1-2 ms.
+(*) Medição antiga com host de bancada saturado por outros processos. A rodada local atual, já com CPU split 0.20/0.40/0.40 e IVF AVX2, ficou em 3.97 ms p99 no k6 oficial.
 
 ## Como executar localmente
 

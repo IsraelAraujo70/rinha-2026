@@ -3,7 +3,7 @@ use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use axum::{
     body::Bytes,
     extract::State,
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
@@ -96,14 +96,7 @@ async fn fraud_score(State(state): State<AppState>, body: Bytes) -> Response {
         }
     };
 
-    let body = match std::panic::catch_unwind(|| score_request(&state, &request)) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            error!(id = %request.id, "panic while scoring request; using approve fallback");
-            FRAUD_FALLBACK
-        }
-    };
-    json_response(body)
+    json_response(score_request(&state, &request))
 }
 
 fn score_request(state: &AppState, request: &FraudRequest) -> &'static [u8] {
@@ -121,11 +114,12 @@ fn score_request(state: &AppState, request: &FraudRequest) -> &'static [u8] {
 }
 
 fn json_response(body: &'static [u8]) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(axum::body::Body::from(Bytes::from_static(body)))
-        .expect("static response always builds")
+    let mut response = Response::new(axum::body::Body::from(Bytes::from_static(body)));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 async fn shutdown_signal() {

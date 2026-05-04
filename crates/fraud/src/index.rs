@@ -5,10 +5,10 @@ use std::{
     arch::x86_64::{
         __m128i, __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_broadcastsi128_si256,
         _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
-        _mm256_set_epi8, _mm256_setzero_si256, _mm256_sub_epi16, _mm256_unpackhi_epi8,
-        _mm256_unpacklo_epi8, _mm_add_epi32, _mm_and_si128, _mm_cvtsi128_si32, _mm_loadu_si128,
-        _mm_madd_epi16, _mm_set_epi8, _mm_setzero_si128, _mm_srli_si128, _mm_sub_epi16,
-        _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+        _mm256_set_epi16, _mm256_set_epi8, _mm256_setzero_si256, _mm256_storeu_si256,
+        _mm256_sub_epi16, _mm256_unpackhi_epi8, _mm256_unpacklo_epi8, _mm_add_epi32, _mm_and_si128,
+        _mm_cvtsi128_si32, _mm_loadu_si128, _mm_madd_epi16, _mm_set_epi8, _mm_setzero_si128,
+        _mm_srli_si128, _mm_sub_epi16, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
     },
     env,
     fs::File,
@@ -61,6 +61,12 @@ struct IvfIndex {
     bbox_min_offset: usize,
     bbox_max_offset: usize,
     records_offset: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Avx2Distance {
+    query: __m256i,
+    mask: __m256i,
 }
 
 pub enum SearchResult {
@@ -327,6 +333,10 @@ impl IvfIndex {
         }
 
         let query = quantize_i16(vector);
+        let distance = Avx2Distance {
+            query: unsafe { load_query_i16_avx2(&query) },
+            mask: unsafe { distance_mask_i16_avx2() },
+        };
         let started_at = Instant::now();
         let mut best_dist = [u64::MAX; K];
         let mut best_label = [0u8; K];
@@ -350,7 +360,7 @@ impl IvfIndex {
             visited[cluster_id] = true;
             if self.scan_cluster(
                 cluster_id,
-                &query,
+                distance,
                 &mut best_dist,
                 &mut best_label,
                 started_at,
@@ -367,7 +377,7 @@ impl IvfIndex {
                     visited[cluster_id] = true;
                     if self.scan_cluster(
                         cluster_id,
-                        &query,
+                        distance,
                         &mut best_dist,
                         &mut best_label,
                         started_at,
@@ -387,7 +397,7 @@ impl IvfIndex {
 
                 if self.scan_cluster(
                     cluster_id,
-                    &query,
+                    distance,
                     &mut best_dist,
                     &mut best_label,
                     started_at,
@@ -417,7 +427,7 @@ impl IvfIndex {
     fn scan_cluster(
         &self,
         cluster_id: usize,
-        query: &[i16; DIMS],
+        distance: Avx2Distance,
         best_dist: &mut [u64; K],
         best_label: &mut [u8; K],
         started_at: Instant,
@@ -436,7 +446,7 @@ impl IvfIndex {
 
             let record_offset = self.records_offset + record_idx * IVF_RECORD_LEN;
             let record = &self.mmap[record_offset..record_offset + IVF_RECORD_LEN];
-            let dist = squared_distance_i16(query, record);
+            let dist = unsafe { squared_distance_i16_avx2(distance.query, distance.mask, record) };
             insert_best_u64(dist, record[IVF_LABEL_OFFSET], best_dist, best_label);
         }
         false
@@ -620,15 +630,29 @@ fn insert_best_cluster(
 }
 
 #[inline]
-fn squared_distance_i16(query: &[i16; DIMS], candidate: &[u8]) -> u64 {
-    let mut total = 0u64;
-    for (dim, value) in query.iter().enumerate() {
-        let offset = dim * size_of::<i16>();
-        let candidate_value = i16::from_le_bytes(candidate[offset..offset + 2].try_into().unwrap());
-        let delta = *value as i32 - candidate_value as i32;
-        total += (delta * delta) as u64;
-    }
-    total
+#[target_feature(enable = "avx2")]
+unsafe fn load_query_i16_avx2(query: &[i16; DIMS]) -> __m256i {
+    let mut padded = [0i16; 16];
+    padded[..DIMS].copy_from_slice(query);
+    _mm256_loadu_si256(padded.as_ptr().cast::<__m256i>())
+}
+
+#[target_feature(enable = "avx2")]
+fn distance_mask_i16_avx2() -> __m256i {
+    _mm256_set_epi16(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn squared_distance_i16_avx2(query: __m256i, mask: __m256i, candidate: &[u8]) -> u64 {
+    let candidate = _mm256_and_si256(
+        _mm256_loadu_si256(candidate.as_ptr().cast::<__m256i>()),
+        mask,
+    );
+    let diff = _mm256_sub_epi16(query, candidate);
+    let sums = _mm256_madd_epi16(diff, diff);
+    let mut lanes = [0i32; 8];
+    _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), sums);
+    lanes.iter().map(|lane| *lane as u32 as u64).sum()
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -696,4 +720,43 @@ fn prefault_pages(mmap: &Mmap) {
         acc ^= bytes[bytes.len() - 1];
     }
     std::hint::black_box(acc);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avx2_i16_distance_ignores_label_lane() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let query = [10_000, 0, -10_000, 500, 900, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let mut candidate = [0u8; IVF_RECORD_LEN];
+        let values: [i16; DIMS] = [9_000, 1, -9_000, 400, 800, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+        for (dim, value) in values.iter().enumerate() {
+            let offset = dim * size_of::<i16>();
+            candidate[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        candidate[IVF_LABEL_OFFSET] = 255;
+
+        let distance = unsafe {
+            squared_distance_i16_avx2(
+                load_query_i16_avx2(&query),
+                distance_mask_i16_avx2(),
+                &candidate,
+            )
+        };
+        let expected = query
+            .iter()
+            .zip(values)
+            .map(|(a, b)| {
+                let delta = *a as i32 - b as i32;
+                (delta * delta) as u64
+            })
+            .sum::<u64>();
+
+        assert_eq!(distance, expected);
+    }
 }
