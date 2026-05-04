@@ -1,11 +1,11 @@
 services:
-  haproxy:
-    image: haproxy:3.3
+  nginx:
+    image: nginx:1.27-alpine
     platform: linux/amd64
     ports:
       - "9999:9999"
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - sockets:/sockets
     depends_on:
       api1:
@@ -23,7 +23,7 @@ services:
           memory: "30MB"
 
   api1:
-    image: ghcr.io/israelaraujo70/rinha-2026:908f8da
+    image: ghcr.io/israelaraujo70/rinha-2026:ed68d38
     platform: linux/amd64
     environment:
       SOCKET_PATH: /sockets/api1.sock
@@ -45,7 +45,7 @@ services:
           memory: "160MB"
 
   api2:
-    image: ghcr.io/israelaraujo70/rinha-2026:908f8da
+    image: ghcr.io/israelaraujo70/rinha-2026:ed68d38
     platform: linux/amd64
     environment:
       SOCKET_PATH: /sockets/api2.sock
