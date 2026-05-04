@@ -200,6 +200,12 @@ fn squared_distance(query: &[u8; RECORD_LEN], candidate: &[u8]) -> u32 {
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 fn squared_distance(query: &[u8; RECORD_LEN], candidate: &[u8]) -> u32 {
+    squared_distance_portable(query, candidate)
+}
+
+#[inline]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn squared_distance_portable(query: &[u8; RECORD_LEN], candidate: &[u8]) -> u32 {
     let mut total = 0u32;
     for idx in 0..DIMS {
         let delta = query[idx] as i32 - candidate[idx] as i32;
