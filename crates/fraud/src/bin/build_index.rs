@@ -1,23 +1,13 @@
 use std::{
     env,
     fs::File,
-    io::{BufReader, BufWriter, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Read},
     path::PathBuf,
 };
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
-use fraud::{
-    index::{encode_record, write_header},
-    vector::Vector,
-};
-use serde::Deserialize;
-
-#[derive(Deserialize)]
-struct ReferenceRecord {
-    vector: Vector,
-    label: String,
-}
+use fraud::build::build_index_from_json_reader;
 
 fn main() -> Result<()> {
     let mut args = env::args_os().skip(1);
@@ -31,26 +21,16 @@ fn main() -> Result<()> {
         .context("usage: build_index <references.json.gz> <data.bin>")?;
 
     let input_file = File::open(&input).with_context(|| format!("open {}", input.display()))?;
-    let decoder = GzDecoder::new(BufReader::new(input_file));
-    let records: Vec<ReferenceRecord> =
-        serde_json::from_reader(decoder).with_context(|| format!("parse {}", input.display()))?;
+    let reader: Box<dyn Read> = if input.extension().is_some_and(|ext| ext == "gz") {
+        Box::new(GzDecoder::new(BufReader::new(input_file)))
+    } else {
+        Box::new(BufReader::new(input_file))
+    };
 
     let output_file =
         File::create(&output).with_context(|| format!("create {}", output.display()))?;
-    let mut writer = BufWriter::new(output_file);
-    write_header(&mut writer, 0)?;
-
-    let mut count = 0u64;
-    for record in &records {
-        writer.write_all(&encode_record(&record.vector, &record.label)?)?;
-        count += 1;
-    }
-
-    writer.flush()?;
-    let mut output_file = writer.into_inner()?;
-    output_file.seek(SeekFrom::Start(0))?;
-    write_header(&mut output_file, count)?;
-    output_file.flush()?;
+    let writer = BufWriter::new(output_file);
+    let count = build_index_from_json_reader(reader, writer)?;
     eprintln!("wrote {count} records to {}", output.display());
     Ok(())
 }
