@@ -4,6 +4,17 @@ Submissão para a [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha
 
 A implementação é em Rust, sem banco de dados externo. Todo o pré-processamento do dataset acontece no build da imagem Docker e o índice fica embutido como arquivo binário acessado por `mmap`.
 
+## Resultado oficial (prévia, Mac Mini Late 2014)
+
+| Métrica | Valor |
+|---|---|
+| `final_score` | **5135.33** |
+| `p99` HTTP | 7.32 ms |
+| `p99_score` | 2135.33 / 3000 |
+| `detection_score` | **3000 / 3000** (máximo absoluto) |
+| FP / FN / Err | 0 / 0 / 0 |
+| commit avaliado | `55fceed` |
+
 ## Topologia
 
 ```
@@ -101,12 +112,13 @@ Em ordem cronológica de impacto medido:
 ### Build profile e runtime
 
 - `lto = "fat"`, `codegen-units = 1` em `[profile.release]`.
-- `target-cpu = "x86-64-v3"` em `.cargo/config.toml` — habilita AVX2/FMA/BMI2 como baseline.
-- Tokio em `current_thread` runtime (cada réplica tem 0.45 vCPU; work-stealing seria desperdício).
+- `target-cpu = "x86-64-v3"` em `.cargo/config.toml` — habilita AVX2/FMA/BMI2 como baseline (note: o `.cargo/` precisa ser copiado no Dockerfile, fácil de esquecer).
+- Tokio em `current_thread` runtime (cada réplica tem 0.40 vCPU; work-stealing seria desperdício).
 - mimalloc como global allocator.
 
 ### nginx
 
+- **0.20 vCPU** (não 0.10) — o LB precisa de espaço pra processar 900 req/s sem virar gargalo. Foi a maior alavanca individual de p99.
 - `keepalive 256` no upstream, `keepalive_requests 100000`.
 - `proxy_buffering off`, `proxy_request_buffering off`.
 - `tcp_nodelay`, `multi_accept`, `epoll`.
@@ -114,7 +126,13 @@ Em ordem cronológica de impacto medido:
 ### Caminho de requisição
 
 - Resposta como uma de 6 `&'static [u8]` pré-construídas — sem `ryu`, sem serde, sem alocação.
+- `Response::new` + `headers_mut().insert` em vez de `Response::builder` — uma alocação a menos por request.
 - Timeout interno de KNN em 3 ms; em caso de timeout, retorna `{"approved": true, "fraud_score": 0.0}` em HTTP 200. Evita o peso 5× de `Err` no `score_det`.
+
+### KNN
+
+- `Index::open` faz **prefault** de todas as páginas do mmap (93 MB) e roda **512 queries de aquecimento** antes de servir. Custo de startup, não de request.
+- Distância i16 vetorizada com **AVX2** (`_mm256_madd_epi16` mascarado para zerar as 2 lanes de padding) — bench p99 de 105 us para 83 us.
 
 ### Build do índice
 
@@ -171,18 +189,21 @@ Outros arquivos:
 
 ### Teste oficial k6 (dataset de 54.100 payloads, 900 req/s)
 
-Todas as medições com host de bancada poluído por outros processos — números do ambiente da Rinha (Mac Mini 2014 dedicado) tendem a ser melhores em latência.
+Local em host de bancada com outros processos competindo por CPU; oficial no Mac Mini Late 2014 dedicado da Rinha.
 
-| Versão | FP+FN | det_score | p99 (best run) | final |
-|---|---|---|---|---|
-| Baseline (`8587310`) | — | — | 3.49 ms | 3868.66 |
-| `nprobe=2` runtime tuning | 178 | — | 4.69 ms | 4615.18 |
-| Wave C (cargo profile + nginx + tokio) | 38 | 2286 | 3.09 ms | 4796.17 |
-| Wave 1 (static resp + mimalloc + adaptive nprobe) | 8 | 2630 | 4.61 ms | 4967.01 |
-| **Wave 2a (K=4096 k-means++ 25 iters)** | **0** | **3000** (max) | 10.68 ms (*) | **4971** |
-| CPU split nginx/API + AVX2 IVF | 0 | 3000 | 3.97 ms | 5401.37 |
+| Versão | Ambiente | FP+FN | det_score | p99 | final |
+|---|---|---|---|---|---|
+| Baseline (`8587310`) | local | — | — | 3.49 ms | 3868.66 |
+| `nprobe=2` runtime tuning | local | 178 | — | 4.69 ms | 4615.18 |
+| Wave C (cargo profile + nginx + tokio) | local | 38 | 2286 | 3.09 ms | 4796.17 |
+| Wave 1 (static resp + mimalloc + adaptive nprobe) | local | 8 | 2630 | 4.61 ms | 4967.01 |
+| Wave 2a (K=4096 k-means++ 25 iters) | local | 0 | 3000 | 10.68 ms (*) | 4971 |
+| Wave 2a (mesmo commit, primeira prévia) | **Mac Mini** | 1 | 2819 | 105.50 ms | 3796.15 |
+| `.cargo/config.toml` no Dockerfile | **Mac Mini** | 1 | 2819 | 112.86 ms | 3766.85 |
+| Warmup do mmap + KNN no startup | **Mac Mini** | 0 | 3000 | 113.83 ms | 3943.74 |
+| **CPU split (nginx 0.20, api 0.40 cada) + AVX2 IVF** | **Mac Mini** | **0** | **3000** | **7.32 ms** | **5135.33** |
 
-(*) Medição antiga com host de bancada saturado por outros processos. A rodada local atual, já com CPU split 0.20/0.40/0.40 e IVF AVX2, ficou em 3.97 ms p99 no k6 oficial.
+(*) Local com host saturado.
 
 ## Como executar localmente
 
@@ -233,9 +254,30 @@ jq . /tmp/rinha/test/results.json
 | Container | Docker / docker-compose |
 | Compilação | rustc 1.x com `target-cpu=x86-64-v3`, LTO fat |
 
-## Trabalho descartado durante a iteração
+## Descobertas
 
-- **Bare hyper rewrite** (substituir axum por hyper puro): mensurado neutro vs axum em 5 runs cada. Complexidade extra sem ganho.
-- **Slim parser com strings borrowed e datetime manual**: regrediu vs serde+chrono em medições controladas. Hipótese é que a validação no-escapes do `&str` zero-copy do serde_json paga mais do que ele economiza no tamanho do payload típico.
+Anotações honestas do que mexeu o ponteiro e o que não mexeu, em ordem de aprendizado:
 
-Detalhes em `git log` — cada onda foi commitada separadamente com motivação e medições.
+1. **Detecção e latência são problemas separados.** A gente tratou como se um arrastasse o outro, mas no fim cada um tem alavancas próprias. Detecção saturou cedo (Wave 2a, K=4096 + k-means++), latência foi outra história.
+
+2. **Ambiente local engana.** Bench local mostrava p99 de KNN em ~80–100 us e a gente estimou p99 HTTP de 1–2 ms na máquina da Rinha. Realidade da primeira prévia oficial: 105 ms. Diferença 50× entre cenário previsto e cenário real.
+
+3. **A culpada era a alocação de CPU do nginx.** Subir `cpus: "0.10"` para `"0.20"` (compensando com 0.05 a menos em cada réplica de API) derrubou o p99 oficial de 113 ms para 7.32 ms. **15× de melhoria com três caracteres trocados.** O nginx é o único processo que toca cada requisição duas vezes (entrada + saída), então é o gargalo natural quando o teto de CPU está apertado. As otimizações da API estavam todas sendo mascaradas por fila no LB.
+
+4. **Dois experimentos parecidos com promessa de muita coisa deram quase nada no Mac Mini:**
+   - Adicionar `target-cpu=x86-64-v3` ao Dockerfile (que faltava no `.cargo/config.toml` copiado no contexto): `± 7 ms` no p99, dentro do ruído.
+   - Pre-faultar o mmap de 93 MB e rodar 512 queries de aquecimento no startup: corrigiu o último FN borderline (efeito real em detecção), mas não moveu o p99. A SSD do Mac Mini não era o gargalo.
+
+5. **AVX2 explícito na distância IVF i16 valeu a pena.** Trocar o loop escalar de 14 dims por um único `_mm256_madd_epi16` com máscara: bench KNN p99 de 105 us para 83 us. Sozinho não fechava a conta, mas combinado com o split de CPU foi um ganho real.
+
+6. **k-means++ + 25 iterações + K=4096 zerou os erros.** A combinação dos três é necessária — só aumentar K sem k-means++ ou sem mais iterações degrada porque centróides ruins espalham mal os pontos.
+
+7. **Adaptive nprobe (8 → 24 nos casos borderline)** é o que deixa pagar pouco no caso médio sem perder recall nos difíceis. Casos confiantes (0/1 ou 4/5 fraudes nos top-K) saem em uma única rodada de probes.
+
+8. **Trabalho que pareceu boa ideia e regrediu / ficou neutro:**
+   - Substituir axum por bare hyper: neutro em 5 runs locais. O overhead do axum não estava custando o suficiente para justificar a complexidade extra.
+   - Parser JSON com `&str` borrowed + datetime manual: regrediu localmente. Hipótese é que o serde_json valida ausência de escapes para fazer o borrow zero-copy, e essa validação custa mais do que economiza num payload pequeno típico. Pode ser que valha em parser totalmente manual com `memchr` (jairoblatt faz isso), mas a versão híbrida não compensou.
+
+9. **A diferença entre 5135 e 6000.** O teto absoluto da Rinha é p99 ≤ 1 ms para zerar `p99_score` em 3000. Estamos em 7.32 ms (p99_score 2135), com detecção já no máximo. Os 865 pontos restantes só sairiam de cortar mais 6 ms do caminho HTTP — provavelmente combinando parser manual + UDS entre nginx e API.
+
+Detalhes commit a commit em `git log`; cada onda saiu como commit separado com motivação e número.
