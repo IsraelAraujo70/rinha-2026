@@ -23,7 +23,7 @@ services:
           memory: "30MB"
 
   api1:
-    image: ghcr.io/israelaraujo70/rinha-2026:ed68d38
+    image: ghcr.io/israelaraujo70/rinha-2026:c4043ae
     platform: linux/amd64
     environment:
       SOCKET_PATH: /sockets/api1.sock
@@ -45,7 +45,7 @@ services:
           memory: "160MB"
 
   api2:
-    image: ghcr.io/israelaraujo70/rinha-2026:ed68d38
+    image: ghcr.io/israelaraujo70/rinha-2026:c4043ae
     platform: linux/amd64
     environment:
       SOCKET_PATH: /sockets/api2.sock
