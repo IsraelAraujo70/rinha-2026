@@ -24,8 +24,8 @@ services:
     environment:
       API_ADDR: 0.0.0.0:8080
       INDEX_PATH: /index/data.bin
-      IVF_NPROBE: "2"
-      IVF_FULL_NPROBE: "8"
+      IVF_NPROBE: "8"
+      IVF_FULL_NPROBE: "24"
       KNN_TIMEOUT_US: "3000"
       RUST_LOG: warn
     deploy:
@@ -41,8 +41,8 @@ services:
     environment:
       API_ADDR: 0.0.0.0:8080
       INDEX_PATH: /index/data.bin
-      IVF_NPROBE: "2"
-      IVF_FULL_NPROBE: "8"
+      IVF_NPROBE: "8"
+      IVF_FULL_NPROBE: "24"
       KNN_TIMEOUT_US: "3000"
       RUST_LOG: warn
     deploy:

@@ -14,9 +14,10 @@ use crate::{
     vector::{quantize_i16, QuantizedI16Vector, Vector, DIMS},
 };
 
-const DEFAULT_IVF_CLUSTERS: usize = 256;
-const DEFAULT_KMEANS_SAMPLE: usize = 32_768;
-const DEFAULT_KMEANS_ITERS: usize = 6;
+const DEFAULT_IVF_CLUSTERS: usize = 4096;
+const DEFAULT_KMEANS_SAMPLE: usize = 50_000;
+const DEFAULT_KMEANS_ITERS: usize = 25;
+const KMEANS_CONVERGENCE_PERMILLE: usize = 1;
 
 #[derive(Deserialize)]
 struct ReferenceRecord {
@@ -198,70 +199,174 @@ fn train_centroids(
     sample_size: usize,
     iterations: usize,
 ) -> Vec<Vector> {
-    let sample = sample_indices(records.len(), sample_size);
-    let mut centroids = initial_centroids(records, &sample, cluster_count);
+    let mut rng = Lcg::new(0xdeadbeefcafebabe);
+    let sample = random_sample(records.len(), sample_size, &mut rng);
+    let mut centroids = kmeans_pp_init(records, &sample, cluster_count, &mut rng);
+    let mut assignments = vec![u32::MAX; records.len()];
 
     for _ in 0..iterations {
-        let mut sums = vec![[0.0f64; DIMS]; cluster_count];
-        let mut counts = vec![0u32; cluster_count];
-
-        for &record_idx in &sample {
-            let cluster_id = nearest_centroid(&records[record_idx].vector, &centroids);
-            counts[cluster_id] += 1;
-            for (dim, sum) in sums[cluster_id].iter_mut().enumerate() {
-                *sum += quantized_to_f32(records[record_idx].vector[dim]) as f64;
-            }
-        }
-
-        for cluster_id in 0..cluster_count {
-            if counts[cluster_id] == 0 {
-                continue;
-            }
-
-            let count = counts[cluster_id] as f64;
-            for dim in 0..DIMS {
-                centroids[cluster_id][dim] = (sums[cluster_id][dim] / count) as f32;
-            }
+        let changed = assign_records_parallel(records, &centroids, &mut assignments);
+        update_centroids(records, &assignments, &mut centroids);
+        if changed * 1000 / records.len().max(1) < KMEANS_CONVERGENCE_PERMILLE {
+            break;
         }
     }
 
     centroids
 }
 
-fn sample_indices(len: usize, sample_size: usize) -> Vec<usize> {
+fn random_sample(len: usize, sample_size: usize, rng: &mut Lcg) -> Vec<usize> {
     if sample_size >= len {
         return (0..len).collect();
     }
-
-    let mut indices = Vec::with_capacity(sample_size);
-    for sample_idx in 0..sample_size {
-        indices.push(sample_idx * len / sample_size);
-    }
-    indices
+    (0..sample_size).map(|_| rng.next_usize(len)).collect()
 }
 
-fn initial_centroids(
+fn kmeans_pp_init(
     records: &[QuantizedReference],
     sample: &[usize],
     cluster_count: usize,
+    rng: &mut Lcg,
 ) -> Vec<Vector> {
+    let sample_vecs: Vec<Vector> = sample
+        .iter()
+        .map(|&idx| {
+            let mut v = [0.0f32; DIMS];
+            for (dim, value) in records[idx].vector.iter().enumerate() {
+                v[dim] = quantized_to_f32(*value);
+            }
+            v
+        })
+        .collect();
+
     let mut centroids = Vec::with_capacity(cluster_count);
-    for cluster_id in 0..cluster_count {
-        let sample_idx = sample[cluster_id * sample.len() / cluster_count];
-        let mut centroid = [0.0; DIMS];
-        for (dim, value) in records[sample_idx].vector.iter().enumerate() {
-            centroid[dim] = quantized_to_f32(*value);
+    let first_idx = rng.next_usize(sample_vecs.len());
+    centroids.push(sample_vecs[first_idx]);
+
+    let mut min_dists = vec![f32::INFINITY; sample_vecs.len()];
+
+    for _ in 1..cluster_count {
+        let last = *centroids.last().unwrap();
+        for (i, vec) in sample_vecs.iter().enumerate() {
+            let d = squared_distance_f32(vec, &last);
+            if d < min_dists[i] {
+                min_dists[i] = d;
+            }
         }
-        centroids.push(centroid);
+        let total: f64 = min_dists.iter().map(|&x| x as f64).sum();
+        if total <= 0.0 {
+            centroids.push(sample_vecs[rng.next_usize(sample_vecs.len())]);
+            continue;
+        }
+        let r = rng.next_f64() * total;
+        let mut cum = 0.0f64;
+        let mut chosen = sample_vecs.len() - 1;
+        for (i, &d) in min_dists.iter().enumerate() {
+            cum += d as f64;
+            if cum >= r {
+                chosen = i;
+                break;
+            }
+        }
+        centroids.push(sample_vecs[chosen]);
     }
+
     centroids
 }
 
 fn assign_records(records: &[QuantizedReference], centroids: &[Vector]) -> Vec<usize> {
-    records
-        .iter()
-        .map(|record| nearest_centroid(&record.vector, centroids))
-        .collect()
+    let mut assignments = vec![u32::MAX; records.len()];
+    assign_records_parallel(records, centroids, &mut assignments);
+    assignments.into_iter().map(|a| a as usize).collect()
+}
+
+fn assign_records_parallel(
+    records: &[QuantizedReference],
+    centroids: &[Vector],
+    assignments: &mut [u32],
+) -> usize {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    let chunk = records.len().div_ceil(threads);
+    let total_changed = std::sync::atomic::AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for (records_chunk, assign_chunk) in
+            records.chunks(chunk).zip(assignments.chunks_mut(chunk))
+        {
+            let total_changed = &total_changed;
+            scope.spawn(move || {
+                let mut local_changed = 0usize;
+                for (record, slot) in records_chunk.iter().zip(assign_chunk.iter_mut()) {
+                    let next = nearest_centroid(&record.vector, centroids) as u32;
+                    if *slot != next {
+                        local_changed += 1;
+                        *slot = next;
+                    }
+                }
+                total_changed.fetch_add(local_changed, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+    });
+
+    total_changed.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn update_centroids(records: &[QuantizedReference], assignments: &[u32], centroids: &mut [Vector]) {
+    let cluster_count = centroids.len();
+    let mut sums = vec![[0.0f64; DIMS]; cluster_count];
+    let mut counts = vec![0u32; cluster_count];
+
+    for (record, &cluster_id) in records.iter().zip(assignments) {
+        let cluster_id = cluster_id as usize;
+        counts[cluster_id] += 1;
+        for (dim, sum) in sums[cluster_id].iter_mut().enumerate() {
+            *sum += quantized_to_f32(record.vector[dim]) as f64;
+        }
+    }
+
+    for cluster_id in 0..cluster_count {
+        if counts[cluster_id] == 0 {
+            continue;
+        }
+        let count = counts[cluster_id] as f64;
+        for dim in 0..DIMS {
+            centroids[cluster_id][dim] = (sums[cluster_id][dim] / count) as f32;
+        }
+    }
+}
+
+#[inline]
+fn squared_distance_f32(a: &Vector, b: &Vector) -> f32 {
+    let mut total = 0.0f32;
+    for dim in 0..DIMS {
+        let delta = a[dim] - b[dim];
+        total += delta * delta;
+    }
+    total
+}
+
+struct Lcg(u64);
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Lcg(seed)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0
+    }
+    fn next_usize(&mut self, n: usize) -> usize {
+        ((self.next_u64() >> 33) as usize) % n.max(1)
+    }
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
 }
 
 fn nearest_centroid(vector: &QuantizedI16Vector, centroids: &[Vector]) -> usize {
