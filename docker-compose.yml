@@ -24,6 +24,7 @@ services:
     environment:
       API_ADDR: 0.0.0.0:8080
       INDEX_PATH: /index/data.bin
+      IVF_NPROBE: "1"
       RUST_LOG: warn
     deploy:
       resources:
@@ -38,6 +39,7 @@ services:
     environment:
       API_ADDR: 0.0.0.0:8080
       INDEX_PATH: /index/data.bin
+      IVF_NPROBE: "1"
       RUST_LOG: warn
     deploy:
       resources:

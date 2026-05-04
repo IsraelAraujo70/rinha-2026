@@ -6,6 +6,7 @@ pub const DIMS: usize = 14;
 
 pub type Vector = [f32; DIMS];
 pub type QuantizedVector = [u8; DIMS];
+pub type QuantizedI16Vector = [i16; DIMS];
 
 const MAX_AMOUNT: f32 = 10_000.0;
 const MAX_INSTALLMENTS: f32 = 12.0;
@@ -95,6 +96,23 @@ pub fn quantize_dim(value: f32) -> u8 {
     } else {
         let scaled = 128.0 + clamp01(value) * 127.0;
         scaled.round() as u8
+    }
+}
+
+pub fn quantize_i16(vector: &Vector) -> QuantizedI16Vector {
+    let mut output = [0; DIMS];
+    for (idx, value) in vector.iter().enumerate() {
+        output[idx] = quantize_i16_dim(*value);
+    }
+    output
+}
+
+#[inline]
+pub fn quantize_i16_dim(value: f32) -> i16 {
+    if value < 0.0 {
+        -10_000
+    } else {
+        (clamp01(value) * 10_000.0).round() as i16
     }
 }
 

@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
-use fraud::build::build_index_from_json_reader;
+use fraud::build::{build_exact_index_from_json_reader, build_index_from_json_reader};
 
 fn main() -> Result<()> {
     let mut args = env::args_os().skip(1);
@@ -30,7 +30,11 @@ fn main() -> Result<()> {
     let output_file =
         File::create(&output).with_context(|| format!("create {}", output.display()))?;
     let writer = BufWriter::new(output_file);
-    let count = build_index_from_json_reader(reader, writer)?;
+    let count = if std::env::var("INDEX_KIND").as_deref() == Ok("exact") {
+        build_exact_index_from_json_reader(reader, writer)?
+    } else {
+        build_index_from_json_reader(reader, writer)?
+    };
     eprintln!("wrote {count} records to {}", output.display());
     Ok(())
 }
