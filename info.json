@@ -1,0 +1,7 @@
+{
+  "participants": ["Israel Araujo"],
+  "social": ["https://github.com/IsraelAraujo70"],
+  "source-code-repo": "https://github.com/IsraelAraujo70/rinha-2026",
+  "stack": ["rust", "axum", "hyper", "tokio", "mimalloc", "nginx"],
+  "open_to_work": true
+}
