@@ -42,11 +42,13 @@ cargo run --release --bin build_index -- /tmp/references.json.gz /tmp/data.bin
 cargo run --release --bin bench_knn -- /tmp/data.bin /tmp/example-payloads.json 1000
 ```
 
-Medição local inicial com o dataset oficial completo:
+Medições locais com o dataset oficial completo:
 
 - `references.json.gz`: 48 MB.
-- `data.bin`: 43 MB para 3.000.000 registros.
-- `build_index`: 9,24s, RSS ~42 MB.
-- KNN brute-force escalar: `avg=6608us p50=6546us p95=6930us p99=7701us`.
+- `data.bin` v1, 15 bytes/registro: 43 MB para 3.000.000 registros.
+- `data.bin` v2, 16 bytes/registro: 46 MB para 3.000.000 registros.
+- `build_index` v2: 9,18s.
+- KNN brute-force escalar v1: `avg=6608us p50=6546us p95=6930us p99=7701us`.
+- KNN v2 alinhado + AVX2: `avg=2979us p50=2931us p95=3249us p99=3805us`.
 
-Essa baseline é exata, mas ainda longe do alvo de p99 sub-ms. A próxima etapa é otimizar o KNN.
+Essa versão ainda é exata, com checksum preservado no benchmark, mas segue longe do alvo de p99 sub-ms. A próxima etapa é avaliar índice aproximado ou particionamento que reduza candidatos.
