@@ -14,17 +14,17 @@ Tentativa de resolver a [Rinha de Backend 2026](https://github.com/zanfranceschi
 
 ```bash
 cargo test
-cargo run --release --bin api
 ```
 
-Sem `/index/data.bin`, a API sobe em modo fallback e aprova com `fraud_score: 0.0`.
-Para gerar o índice local:
+Para gerar o índice local e subir a API:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/references.json.gz -o /tmp/references.json.gz
 cargo run --release --bin build_index -- /tmp/references.json.gz /tmp/data.bin
 INDEX_PATH=/tmp/data.bin cargo run --release --bin api
 ```
+
+A API falha no startup se o índice não existir ou estiver inválido. Durante uma requisição, payload inválido, pânico no scoring ou timeout interno retornam fallback aprovado com HTTP 200 para evitar penalidade de erro HTTP.
 
 Para subir a topologia completa:
 

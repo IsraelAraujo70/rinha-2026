@@ -1,4 +1,15 @@
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("this implementation targets linux/amd64 only");
+
 use std::{
+    arch::x86_64::{
+        __m128i, __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_broadcastsi128_si256,
+        _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_set_epi8, _mm256_setzero_si256, _mm256_sub_epi16, _mm256_unpackhi_epi8,
+        _mm256_unpacklo_epi8, _mm_add_epi32, _mm_and_si128, _mm_cvtsi128_si32, _mm_loadu_si128,
+        _mm_madd_epi16, _mm_set_epi8, _mm_setzero_si128, _mm_srli_si128, _mm_sub_epi16,
+        _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+    },
     fs::File,
     path::Path,
     time::{Duration, Instant},
@@ -19,6 +30,11 @@ const K: usize = 5;
 pub struct Index {
     mmap: Mmap,
     count: usize,
+}
+
+pub enum SearchResult {
+    Score(f32),
+    TimedOut,
 }
 
 impl Index {
@@ -55,12 +71,13 @@ impl Index {
         self.count
     }
 
-    pub fn fraud_score(&self, vector: &Vector, deadline: Option<Duration>) -> Option<f32> {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                return unsafe { self.fraud_score_avx2(vector, deadline) };
-            }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn fraud_score(&self, vector: &Vector, deadline: Option<Duration>) -> SearchResult {
+        if std::is_x86_feature_detected!("avx2") {
+            return unsafe { self.fraud_score_avx2(vector, deadline) };
         }
 
         self.fraud_score_one_at_a_time(vector, deadline)
@@ -70,9 +87,9 @@ impl Index {
         &self,
         vector: &Vector,
         deadline: Option<Duration>,
-    ) -> Option<f32> {
+    ) -> SearchResult {
         if self.count == 0 {
-            return Some(0.0);
+            return SearchResult::Score(0.0);
         }
 
         let query = padded_quantize(vector);
@@ -85,7 +102,7 @@ impl Index {
             if idx & 0x3fff == 0 {
                 if let Some(max_duration) = deadline {
                     if started_at.elapsed() > max_duration {
-                        return None;
+                        return SearchResult::TimedOut;
                     }
                 }
             }
@@ -96,14 +113,13 @@ impl Index {
             insert_best(dist, record[LABEL_OFFSET], &mut best_dist, &mut best_label);
         }
 
-        Some(score_from_labels(self.count, &best_label))
+        SearchResult::Score(score_from_labels(self.count, &best_label))
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    unsafe fn fraud_score_avx2(&self, vector: &Vector, deadline: Option<Duration>) -> Option<f32> {
+    unsafe fn fraud_score_avx2(&self, vector: &Vector, deadline: Option<Duration>) -> SearchResult {
         if self.count == 0 {
-            return Some(0.0);
+            return SearchResult::Score(0.0);
         }
 
         let query = padded_quantize(vector);
@@ -113,14 +129,14 @@ impl Index {
         let records = &self.mmap[HEADER_LEN..];
         let avx2_query = broadcast_query_avx2(&query);
         let avx2_mask = distance_mask_avx2();
-        let avx2_zero = std::arch::x86_64::_mm256_setzero_si256();
+        let avx2_zero = _mm256_setzero_si256();
 
         let mut idx = 0usize;
         while idx + 3 < self.count {
             if idx & 0x3fff == 0 {
                 if let Some(max_duration) = deadline {
                     if started_at.elapsed() > max_duration {
-                        return None;
+                        return SearchResult::TimedOut;
                     }
                 }
             }
@@ -170,7 +186,7 @@ impl Index {
             insert_best(dist, record[LABEL_OFFSET], &mut best_dist, &mut best_label);
         }
 
-        Some(score_from_labels(self.count, &best_label))
+        SearchResult::Score(score_from_labels(self.count, &best_label))
     }
 }
 
@@ -198,11 +214,6 @@ fn squared_distance(query: &[u8; RECORD_LEN], candidate: &[u8]) -> u32 {
 
 #[target_feature(enable = "sse2")]
 unsafe fn squared_distance_sse2(query: &[u8; RECORD_LEN], candidate: &[u8]) -> u32 {
-    use std::arch::x86_64::{
-        __m128i, _mm_add_epi32, _mm_and_si128, _mm_loadu_si128, _mm_madd_epi16, _mm_set_epi8,
-        _mm_setzero_si128, _mm_sub_epi16, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
-    };
-
     let mask = _mm_set_epi8(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
     let zero = _mm_setzero_si128();
     let query_bytes = _mm_loadu_si128(query.as_ptr().cast::<__m128i>());
@@ -221,20 +232,13 @@ unsafe fn squared_distance_sse2(query: &[u8; RECORD_LEN], candidate: &[u8]) -> u
     horizontal_sum_i32x4(sums)
 }
 
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn squared_distance_pair_avx2(
-    query_bytes: std::arch::x86_64::__m256i,
-    mask: std::arch::x86_64::__m256i,
-    zero: std::arch::x86_64::__m256i,
+    query_bytes: __m256i,
+    mask: __m256i,
+    zero: __m256i,
     candidates: &[u8],
 ) -> [u32; 2] {
-    use std::arch::x86_64::{
-        __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_castsi256_si128,
-        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_sub_epi16,
-        _mm256_unpackhi_epi8, _mm256_unpacklo_epi8,
-    };
-
     let candidate_bytes = _mm256_and_si256(
         _mm256_loadu_si256(candidates.as_ptr().cast::<__m256i>()),
         mask,
@@ -255,29 +259,20 @@ unsafe fn squared_distance_pair_avx2(
     ]
 }
 
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn horizontal_sum_i32x4(value: std::arch::x86_64::__m128i) -> u32 {
-    use std::arch::x86_64::{_mm_add_epi32, _mm_cvtsi128_si32, _mm_srli_si128};
-
+unsafe fn horizontal_sum_i32x4(value: __m128i) -> u32 {
     let sum = _mm_add_epi32(value, _mm_srli_si128::<8>(value));
     let sum = _mm_add_epi32(sum, _mm_srli_si128::<4>(sum));
     _mm_cvtsi128_si32(sum) as u32
 }
 
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn broadcast_query_avx2(query: &[u8; RECORD_LEN]) -> std::arch::x86_64::__m256i {
-    use std::arch::x86_64::{__m128i, _mm256_broadcastsi128_si256, _mm_loadu_si128};
-
+unsafe fn broadcast_query_avx2(query: &[u8; RECORD_LEN]) -> __m256i {
     _mm256_broadcastsi128_si256(_mm_loadu_si128(query.as_ptr().cast::<__m128i>()))
 }
 
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn distance_mask_avx2() -> std::arch::x86_64::__m256i {
-    use std::arch::x86_64::_mm256_set_epi8;
-
+unsafe fn distance_mask_avx2() -> __m256i {
     _mm256_set_epi8(
         0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, -1, -1, -1, -1, -1, -1,
         -1, -1, -1, -1, -1, -1, -1, -1,

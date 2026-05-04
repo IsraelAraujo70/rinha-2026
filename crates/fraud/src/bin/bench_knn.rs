@@ -1,7 +1,11 @@
 use std::{env, fs::File, path::PathBuf, time::Instant};
 
 use anyhow::{Context, Result};
-use fraud::{index::Index, payload::FraudRequest, vector::vectorize};
+use fraud::{
+    index::{Index, SearchResult},
+    payload::FraudRequest,
+    vector::vectorize,
+};
 
 fn main() -> Result<()> {
     let mut args = env::args_os().skip(1);
@@ -33,7 +37,10 @@ fn main() -> Result<()> {
     for idx in 0..iterations {
         let vector = &vectors[idx % vectors.len()];
         let started_at = Instant::now();
-        let score = index.fraud_score(vector, None).unwrap_or(0.0);
+        let score = match index.fraud_score(vector, None) {
+            SearchResult::Score(score) => score,
+            SearchResult::TimedOut => unreachable!("bench runs without a deadline"),
+        };
         durations.push(started_at.elapsed().as_nanos() as u64);
         checksum += score;
     }

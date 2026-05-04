@@ -94,7 +94,7 @@ mod tests {
     use std::io::{Cursor, Read, Seek};
 
     use super::*;
-    use crate::index::Index;
+    use crate::index::{Index, SearchResult};
 
     #[test]
     fn builds_index_from_json_array_without_buffering_records() {
@@ -128,7 +128,10 @@ mod tests {
         build_index_from_json_reader(&json[..], file).unwrap();
 
         let index = Index::open(&path).unwrap();
-        let score = index.fraud_score(&[0.0; 14], None).unwrap();
+        let score = match index.fraud_score(&[0.0; 14], None) {
+            SearchResult::Score(score) => score,
+            SearchResult::TimedOut => unreachable!("test runs without a deadline"),
+        };
 
         std::fs::remove_file(path).unwrap();
         assert_eq!(index.len(), 6);
