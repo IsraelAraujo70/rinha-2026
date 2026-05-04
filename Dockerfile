@@ -3,6 +3,7 @@ FROM --platform=$BUILDPLATFORM rust:1-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml ./
 COPY Cargo.lock ./
+COPY .cargo ./.cargo
 COPY crates ./crates
 RUN cargo build --release --bin api --bin build_index
 
