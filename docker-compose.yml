@@ -1,11 +1,11 @@
 services:
-  haproxy:
-    image: haproxy:3.3
+  nginx:
+    image: nginx:1.27-alpine
     platform: linux/amd64
     ports:
       - "9999:9999"
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - sockets:/sockets
     depends_on:
       api1:
