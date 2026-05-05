@@ -1,9 +1,8 @@
 use std::{env, path::PathBuf, time::Duration};
 
 use fraud::{
+    fast_parse::parse_and_vectorize,
     index::{Index, SearchResult},
-    payload::FraudRequest,
-    vector::vectorize,
 };
 use mimalloc::MiMalloc;
 use monoio::{
@@ -201,11 +200,10 @@ fn find_content_length(headers: &[u8]) -> Option<usize> {
 
 #[inline]
 fn score_body(index: &Index, knn_timeout: Duration, body: &[u8]) -> &'static [u8] {
-    let request = match serde_json::from_slice::<FraudRequest>(body) {
-        Ok(r) => r,
-        Err(_) => return FRAUD_FALLBACK,
+    let vector = match parse_and_vectorize(body) {
+        Some(v) => v,
+        None => return FRAUD_FALLBACK,
     };
-    let vector = vectorize(&request);
     let fraud_score = match index.fraud_score(&vector, Some(knn_timeout)) {
         SearchResult::Score(s) => s,
         SearchResult::TimedOut => return FRAUD_FALLBACK,
