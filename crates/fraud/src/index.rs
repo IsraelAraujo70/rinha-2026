@@ -402,6 +402,12 @@ impl IvfIndex {
             if frauds == 2 || frauds == 3 {
                 for &cluster_id in &cluster_ids[self.nprobe..max_probes] {
                     visited[cluster_id] = true;
+                    // bbox is a sound lower bound for squared distance to any record
+                    // in the cluster; if it already exceeds the current K-th nearest,
+                    // this cluster cannot improve the top-K and we skip the scan.
+                    if self.bbox_lower_bound(&query, cluster_id) > best_dist[K - 1] {
+                        continue;
+                    }
                     if self.scan_cluster(
                         cluster_id,
                         distance,
