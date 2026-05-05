@@ -6,6 +6,7 @@ services:
       - "9999:9999"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - sockets:/sockets
     depends_on:
       api1:
         condition: service_started
@@ -18,15 +19,17 @@ services:
           memory: "20MB"
 
   api1:
-    image: ghcr.io/israelaraujo70/rinha-2026:db7bac4
+    image: ghcr.io/israelaraujo70/rinha-2026:b3902dd
     platform: linux/amd64
     environment:
-      API_ADDR: 0.0.0.0:8080
+      API_UDS_PATH: /sockets/api1.sock
       INDEX_PATH: /index/data.bin
       IVF_NPROBE: "8"
       IVF_FULL_NPROBE: "24"
       KNN_TIMEOUT_US: "3000"
       RUST_LOG: warn
+    volumes:
+      - sockets:/sockets
     deploy:
       resources:
         limits:
@@ -34,17 +37,22 @@ services:
           memory: "160MB"
 
   api2:
-    image: ghcr.io/israelaraujo70/rinha-2026:db7bac4
+    image: ghcr.io/israelaraujo70/rinha-2026:b3902dd
     platform: linux/amd64
     environment:
-      API_ADDR: 0.0.0.0:8080
+      API_UDS_PATH: /sockets/api2.sock
       INDEX_PATH: /index/data.bin
       IVF_NPROBE: "8"
       IVF_FULL_NPROBE: "24"
       KNN_TIMEOUT_US: "3000"
       RUST_LOG: warn
+    volumes:
+      - sockets:/sockets
     deploy:
       resources:
         limits:
           cpus: "0.40"
           memory: "160MB"
+
+volumes:
+  sockets:
