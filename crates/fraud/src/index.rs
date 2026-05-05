@@ -359,6 +359,15 @@ impl IvfIndex {
         let mut visited = [false; MAX_IVF_CLUSTERS];
         for &cluster_id in &cluster_ids[..self.nprobe] {
             visited[cluster_id] = true;
+            // bbox prune: skip cluster if its tightest possible squared distance
+            // already exceeds the current worst-of-top5. Free for the very first
+            // cluster (best_dist[K-1] == u64::MAX, prune never triggers); pays
+            // off as the threshold tightens after each insert.
+            if best_dist[K - 1] != u64::MAX
+                && self.bbox_lower_bound(&query, cluster_id) > best_dist[K - 1]
+            {
+                continue;
+            }
             if self.scan_cluster(
                 cluster_id,
                 distance,
@@ -376,6 +385,9 @@ impl IvfIndex {
             if frauds == 2 || frauds == 3 {
                 for &cluster_id in &cluster_ids[self.nprobe..max_probes] {
                     visited[cluster_id] = true;
+                    if self.bbox_lower_bound(&query, cluster_id) > best_dist[K - 1] {
+                        continue;
+                    }
                     if self.scan_cluster(
                         cluster_id,
                         distance,
@@ -439,8 +451,10 @@ impl IvfIndex {
         let bytes_base = self.records_offset + start * IVF_RECORD_LEN;
         let records = &self.mmap[bytes_base..bytes_base + (end - start) * IVF_RECORD_LEN];
 
-        for record_idx in 0..(end - start) {
-            if record_idx & 0x3fff == 0 {
+        let mut idx = 0usize;
+        let pair_count = (end - start) & !1;
+        while idx < pair_count {
+            if idx & 0x3fff == 0 {
                 if let Some(max_duration) = deadline {
                     if started_at.elapsed() > max_duration {
                         return true;
@@ -448,20 +462,25 @@ impl IvfIndex {
                 }
             }
 
-            let off = record_idx * IVF_RECORD_LEN;
+            let off = idx * IVF_RECORD_LEN;
+            let pair = &records[off..off + IVF_RECORD_LEN * 2];
+            let [d0, d1] =
+                unsafe { squared_distance_i16_pair_avx2(distance.query, distance.mask, pair) };
+            insert_best_u64(d0, pair[IVF_LABEL_OFFSET], best_dist, best_label);
+            insert_best_u64(
+                d1,
+                pair[IVF_RECORD_LEN + IVF_LABEL_OFFSET],
+                best_dist,
+                best_label,
+            );
+            idx += 2;
+        }
+
+        if idx < end - start {
+            let off = idx * IVF_RECORD_LEN;
             let record = &records[off..off + IVF_RECORD_LEN];
-            let threshold = best_dist[K - 1];
-            let dist = unsafe {
-                squared_distance_i16_early_exit_avx2(
-                    distance.query,
-                    distance.mask,
-                    record.as_ptr(),
-                    threshold,
-                )
-            };
-            if dist < threshold {
-                insert_best_u64(dist, record[IVF_LABEL_OFFSET], best_dist, best_label);
-            }
+            let dist = unsafe { squared_distance_i16_avx2(distance.query, distance.mask, record) };
+            insert_best_u64(dist, record[IVF_LABEL_OFFSET], best_dist, best_label);
         }
         false
     }
@@ -656,7 +675,6 @@ fn distance_mask_i16_avx2() -> __m256i {
     _mm256_set_epi16(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
 }
 
-#[allow(dead_code)] // kept as the reference implementation exercised by tests
 #[target_feature(enable = "avx2")]
 unsafe fn squared_distance_i16_avx2(query: __m256i, mask: __m256i, candidate: &[u8]) -> u64 {
     let candidate = _mm256_and_si256(
@@ -668,7 +686,6 @@ unsafe fn squared_distance_i16_avx2(query: __m256i, mask: __m256i, candidate: &[
     horizontal_sum_i32x8_to_u64(sums)
 }
 
-#[allow(dead_code)] // kept as reference for the paired-scan A2 variant
 #[target_feature(enable = "avx2")]
 unsafe fn squared_distance_i16_pair_avx2(
     query: __m256i,
@@ -694,56 +711,6 @@ unsafe fn squared_distance_i16_pair_avx2(
     ]
 }
 
-/// Squared L2 distance with two-stage early exit. Returns u64::MAX if the lower
-/// half (dims 0-7) already exceeds `threshold`, skipping the upper-half work.
-///
-/// query holds the 14 i16 query lanes (lanes 14-15 must be zero); mask zeroes
-/// out lanes 14-15 of the candidate so label/padding bytes don't contribute.
-#[target_feature(enable = "avx2")]
-unsafe fn squared_distance_i16_early_exit_avx2(
-    query: __m256i,
-    mask: __m256i,
-    candidate_ptr: *const u8,
-    threshold: u64,
-) -> u64 {
-    // Lower half: dims 0-7 (16 bytes = 8 i16). Mask isn't needed here, only
-    // the upper half has masked lanes — but we apply consistent narrowing.
-    let q_lo = _mm256_castsi256_si128(query);
-    let c_lo = _mm_loadu_si128(candidate_ptr.cast::<__m128i>());
-    let d_lo = _mm_sub_epi16(q_lo, c_lo);
-    let s_lo = _mm_madd_epi16(d_lo, d_lo);
-    let lo_sum = horizontal_sum_i32x4_to_u64(s_lo);
-    if lo_sum >= threshold {
-        return u64::MAX;
-    }
-
-    // Upper half: dims 8-13 + 2 masked lanes (label + padding zeroed by mask).
-    let q_hi = _mm256_extracti128_si256::<1>(query);
-    let mask_hi = _mm256_extracti128_si256::<1>(mask);
-    let c_hi_raw = _mm_loadu_si128(candidate_ptr.add(16).cast::<__m128i>());
-    let c_hi = _mm_and_si128(c_hi_raw, mask_hi);
-    let d_hi = _mm_sub_epi16(q_hi, c_hi);
-    let s_hi = _mm_madd_epi16(d_hi, d_hi);
-    let hi_sum = horizontal_sum_i32x4_to_u64(s_hi);
-
-    lo_sum + hi_sum
-}
-
-#[inline]
-#[target_feature(enable = "sse2")]
-unsafe fn horizontal_sum_i32x4_to_u64(value: __m128i) -> u64 {
-    // 4 non-negative i32 lanes (each ≤ ~8e8). Zero-extend to u64 before
-    // adding so the four-lane reduction (≤ 3.2e9) can't overflow u32 silently.
-    let zero = _mm_setzero_si128();
-    let lo = _mm_unpacklo_epi32(value, zero); // [v[0], v[1]] as 2× u64
-    let hi = _mm_unpackhi_epi32(value, zero); // [v[2], v[3]] as 2× u64
-    let sum = _mm_add_epi64(lo, hi);
-    let upper = _mm_unpackhi_epi64(sum, zero);
-    let final_sum = _mm_add_epi64(sum, upper);
-    _mm_cvtsi128_si64(final_sum) as u64
-}
-
-#[allow(dead_code)] // exercised by squared_distance_i16_avx2 / pair variants
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn horizontal_sum_i32x8_to_u64(sums: __m256i) -> u64 {
@@ -907,45 +874,4 @@ mod tests {
         assert_eq!(pair_dist, [expected, expected]);
     }
 
-    #[test]
-    fn early_exit_matches_full_distance_when_threshold_is_max() {
-        if !std::is_x86_feature_detected!("avx2") {
-            return;
-        }
-
-        let query: [i16; DIMS] = [10_000, 0, -10_000, 500, 900, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let mut candidate = [0u8; IVF_RECORD_LEN];
-        let values: [i16; DIMS] = [9_000, 1, -9_000, 400, 800, 9, 8, 7, 6, 5, 4, 3, 2, 1];
-        for (dim, value) in values.iter().enumerate() {
-            let offset = dim * size_of::<i16>();
-            candidate[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-        }
-        candidate[IVF_LABEL_OFFSET] = 1;
-
-        let q = unsafe { load_query_i16_avx2(&query) };
-        let m = unsafe { distance_mask_i16_avx2() };
-        let full = unsafe { squared_distance_i16_avx2(q, m, &candidate) };
-        let early_no_exit =
-            unsafe { squared_distance_i16_early_exit_avx2(q, m, candidate.as_ptr(), u64::MAX) };
-        assert_eq!(early_no_exit, full);
-    }
-
-    #[test]
-    fn early_exit_returns_max_when_lower_half_exceeds_threshold() {
-        if !std::is_x86_feature_detected!("avx2") {
-            return;
-        }
-
-        // Heavy deltas in dims 0-7 so even the lower-half partial sum is large.
-        let query: [i16; DIMS] = [30_000; DIMS];
-        let mut candidate = [0u8; IVF_RECORD_LEN];
-        // candidate stays zero -> lower-half sum = 8 * 30000^2 = 7.2e9.
-        candidate[IVF_LABEL_OFFSET] = 0;
-
-        let q = unsafe { load_query_i16_avx2(&query) };
-        let m = unsafe { distance_mask_i16_avx2() };
-        let early =
-            unsafe { squared_distance_i16_early_exit_avx2(q, m, candidate.as_ptr(), 1_000_000) };
-        assert_eq!(early, u64::MAX);
-    }
 }
