@@ -8,7 +8,7 @@ use mimalloc::MiMalloc;
 use monoio::{
     buf::SliceMut,
     io::{AsyncReadRent, AsyncWriteRentExt},
-    net::{TcpListener, UnixListener},
+    net::{ListenerOpts, TcpListener, UnixListener},
 };
 
 #[global_allocator]
@@ -36,20 +36,32 @@ fn main() -> anyhow::Result<()> {
 
     let uds_path = env::var_os("API_UDS_PATH").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty());
 
-    let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
-        .with_entries(256)
-        .build()?;
-
     if let Some(path) = uds_path {
+        // io_uring + AF_UNIX has had subtle issues with subsequent reads on a
+        // kept-alive connection (the second recv blocks even when data has
+        // already arrived). epoll is fine here; for the throughput levels in
+        // this challenge it is not the bottleneck.
+        let mut rt = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+            .with_entries(256)
+            .enable_timer()
+            .build()?;
         let _ = std::fs::remove_file(&path);
+        // SO_REUSEPORT is meaningless for AF_UNIX; setsockopt returns ENOTSUP.
+        let opts = ListenerOpts::new().reuse_port(false).reuse_addr(false);
         rt.block_on(async move {
-            let listener = UnixListener::bind(&path).expect("bind unix");
+            let listener = UnixListener::bind_with_config(&path, &opts).expect("bind unix");
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         monoio::spawn(handle_connection(stream, index, knn_timeout));
+                        // Without an explicit yield here, the spawned UDS task
+                        // never gets polled — accept().await loops back to a
+                        // fresh op submission and the runtime picks I/O over
+                        // draining its task queue. A 1 ns timer is enough to
+                        // force the inner task drain.
+                        monoio::time::sleep(std::time::Duration::from_nanos(1)).await;
                     }
                     Err(_) => continue,
                 }
@@ -58,6 +70,9 @@ fn main() -> anyhow::Result<()> {
     } else {
         let addr_str = env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
         let addr: std::net::SocketAddr = addr_str.parse()?;
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .with_entries(256)
+            .build()?;
         rt.block_on(async move {
             let listener = TcpListener::bind(addr).expect("bind");
             loop {
@@ -88,14 +103,16 @@ async fn handle_connection<S>(mut stream: S, index: &'static Index, knn_timeout:
 where
     S: AsyncReadRent + AsyncWriteRentExt,
 {
-    let mut buf: Vec<u8> = vec![0u8; 8192];
+    // 8 KB initial: covers any conformant Rinha payload (~600 B) and HTTP
+    // headers nginx adds (~250 B). Box<[u8]> has fixed len; monoio's set_init
+    // is a no-op for it, so the buffer state does not get corrupted across
+    // consecutive reads on a kept-alive connection (Vec<u8> went down to
+    // bytes-just-read and broke the next read submission).
+    let mut buf: Box<[u8]> = vec![0u8; 8192].into_boxed_slice();
     let mut start: usize = 0;
     let mut filled: usize = 0;
 
     loop {
-        // Find end of request headers, reading more bytes into `buf` until we see the
-        // CRLFCRLF marker. Two-cursor layout: `start..filled` holds the unparsed slice
-        // of the current keep-alive cycle.
         let head_end = loop {
             if let Some(rel) = find_headers_end(&buf[start..filled]) {
                 break start + rel + 4;
@@ -106,7 +123,10 @@ where
                     filled -= start;
                     start = 0;
                 } else {
-                    buf.resize(buf.len() * 2, 0);
+                    // grow Box by reallocating
+                    let mut grown = vec![0u8; buf.len() * 2].into_boxed_slice();
+                    grown[..buf.len()].copy_from_slice(&buf);
+                    buf = grown;
                 }
             }
             let cap = buf.len();
@@ -125,7 +145,9 @@ where
         let next_start = if method == Method::Post {
             let total = head_end + content_len;
             if total > buf.len() {
-                buf.resize(total, 0);
+                let mut grown = vec![0u8; total].into_boxed_slice();
+                grown[..buf.len()].copy_from_slice(&buf);
+                buf = grown;
             }
             while filled < total {
                 let cap = buf.len();
