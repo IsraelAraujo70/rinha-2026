@@ -24,7 +24,7 @@ services:
     environment:
       SOCKET_PATH: /sockets/api1.sock
       INDEX_PATH: /index/data.bin
-      IVF_NPROBE: "6"
+      IVF_NPROBE: "8"
       IVF_FULL_NPROBE: "64"
       KNN_TIMEOUT_US: "3000"
       RUST_LOG: warn
@@ -42,7 +42,7 @@ services:
     environment:
       SOCKET_PATH: /sockets/api2.sock
       INDEX_PATH: /index/data.bin
-      IVF_NPROBE: "6"
+      IVF_NPROBE: "8"
       IVF_FULL_NPROBE: "64"
       KNN_TIMEOUT_US: "3000"
       RUST_LOG: warn
