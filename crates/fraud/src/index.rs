@@ -3,9 +3,11 @@ compile_error!("this implementation targets linux/amd64 only");
 
 use std::{
     arch::x86_64::{
-        __m128i, __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_broadcastsi128_si256,
-        _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
-        _mm256_set_epi16, _mm256_set_epi8, _mm256_setzero_si256, _mm256_sub_epi16,
+        __m128i, __m256, __m256i, _CMP_LT_OS, _mm256_add_epi32, _mm256_and_si256,
+        _mm256_broadcastsi128_si256, _mm256_castsi256_si128, _mm256_cmp_ps, _mm256_cvtepi16_epi32,
+        _mm256_cvtepi32_ps, _mm256_extracti128_si256, _mm256_fmadd_ps, _mm256_loadu_si256,
+        _mm256_madd_epi16, _mm256_movemask_ps, _mm256_set1_ps, _mm256_set_epi16, _mm256_set_epi8,
+        _mm256_setzero_ps, _mm256_setzero_si256, _mm256_sub_epi16, _mm256_sub_ps,
         _mm256_unpackhi_epi8, _mm256_unpacklo_epi8, _mm_add_epi32, _mm_add_epi64, _mm_and_si128,
         _mm_cvtsi128_si32, _mm_cvtsi128_si64, _mm_loadu_si128, _mm_madd_epi16, _mm_set_epi8,
         _mm_setzero_si128, _mm_srli_si128, _mm_sub_epi16, _mm_unpackhi_epi32, _mm_unpackhi_epi64,
@@ -62,7 +64,19 @@ struct IvfIndex {
     bbox_min_offset: usize,
     bbox_max_offset: usize,
     records_offset: usize,
+    // SoA block-8 storage built once at open time.
+    // Layout per block (224 bytes): dim0 of 8 records (8×i16=16B), dim1 of 8 records, ..., dim13 of 8 records.
+    // Padded slots in the last block of a cluster carry i16::MAX in every dim → squared distance ≥ 1.5e10
+    // → never beats any real top-K, no special masking needed.
+    soa_dims: Box<[i16]>,
+    soa_labels: Box<[u8]>,
+    cluster_block_offsets: Box<[u32]>, // length cluster_count + 1
+    cluster_sizes: Box<[u32]>,         // length cluster_count
 }
+
+const BLOCK_RECORDS: usize = 8;
+const BLOCK_DIM_STRIDE: usize = BLOCK_RECORDS; // i16 per dim per block
+const BLOCK_DIMS_LEN: usize = DIMS * BLOCK_DIM_STRIDE; // 14 * 8 = 112 i16 = 224 bytes
 
 #[derive(Clone, Copy)]
 struct Avx2Distance {
@@ -182,6 +196,53 @@ impl Index {
         let full_nprobe =
             env_usize("IVF_FULL_NPROBE", nprobe).clamp(nprobe, cluster_count.min(MAX_IVF_NPROBE));
         let repair = env_bool("IVF_REPAIR", false);
+
+        // ---- Build SoA block-8 storage (~1.5 MB total for ~50k records) ----
+        // Compute total blocks across all clusters = sum of ceil(cluster_size / 8).
+        let mut cluster_sizes: Vec<u32> = Vec::with_capacity(cluster_count);
+        let mut cluster_block_offsets: Vec<u32> = Vec::with_capacity(cluster_count + 1);
+        cluster_block_offsets.push(0u32);
+        let mut total_blocks: u32 = 0;
+        for cluster_id in 0..cluster_count {
+            let off_lo = offsets_offset + cluster_id * size_of::<u64>();
+            let off_hi = off_lo + size_of::<u64>();
+            let start = u64::from_le_bytes(mmap[off_lo..off_lo + 8].try_into().unwrap()) as usize;
+            let end = u64::from_le_bytes(mmap[off_hi..off_hi + 8].try_into().unwrap()) as usize;
+            let n = (end - start) as u32;
+            let blocks = n.div_ceil(BLOCK_RECORDS as u32);
+            cluster_sizes.push(n);
+            total_blocks += blocks;
+            cluster_block_offsets.push(total_blocks);
+        }
+
+        let soa_dims_len = total_blocks as usize * BLOCK_DIMS_LEN;
+        let soa_labels_len = total_blocks as usize * BLOCK_RECORDS;
+        // i16::MAX on every padded slot → squared diff per dim ≈ (32767 + |query|)² ≥ 1e9,
+        // summed over 14 dims ≥ 1.4e10. No real top-K candidate can come anywhere near that,
+        // so padded slots are filtered out by the threshold mask without an explicit length check.
+        let mut soa_dims: Vec<i16> = vec![i16::MAX; soa_dims_len];
+        let mut soa_labels: Vec<u8> = vec![0u8; soa_labels_len];
+
+        for cluster_id in 0..cluster_count {
+            let off_lo = offsets_offset + cluster_id * size_of::<u64>();
+            let start = u64::from_le_bytes(mmap[off_lo..off_lo + 8].try_into().unwrap()) as usize;
+            let n = cluster_sizes[cluster_id] as usize;
+            let block_base = cluster_block_offsets[cluster_id] as usize;
+
+            for r in 0..n {
+                let block_idx = block_base + r / BLOCK_RECORDS;
+                let slot = r % BLOCK_RECORDS;
+                let record_off = records_offset + (start + r) * IVF_RECORD_LEN;
+                let dims_block_off = block_idx * BLOCK_DIMS_LEN;
+                for d in 0..DIMS {
+                    let lo = record_off + d * size_of::<i16>();
+                    let v = i16::from_le_bytes(mmap[lo..lo + 2].try_into().unwrap());
+                    soa_dims[dims_block_off + d * BLOCK_DIM_STRIDE + slot] = v;
+                }
+                soa_labels[block_idx * BLOCK_RECORDS + slot] = mmap[record_off + IVF_LABEL_OFFSET];
+            }
+        }
+
         Ok(Self {
             inner: IndexInner::Ivf(IvfIndex {
                 mmap,
@@ -195,6 +256,10 @@ impl Index {
                 bbox_min_offset,
                 bbox_max_offset,
                 records_offset,
+                soa_dims: soa_dims.into_boxed_slice(),
+                soa_labels: soa_labels.into_boxed_slice(),
+                cluster_block_offsets: cluster_block_offsets.into_boxed_slice(),
+                cluster_sizes: cluster_sizes.into_boxed_slice(),
             }),
         })
     }
@@ -333,13 +398,16 @@ impl IvfIndex {
             return SearchResult::Score(0.0);
         }
 
-        let query = quantize_i16(vector);
-        let distance = Avx2Distance {
-            query: unsafe { load_query_i16_avx2(&query) },
-            mask: unsafe { distance_mask_i16_avx2() },
-        };
+        // Query quantized to i16 for centroid pre-rank (we already had this), then
+        // converted to f32 for the block-8 scan kernel (uses _mm256_fmadd_ps).
+        let query_i16 = quantize_i16(vector);
+        let mut query_f32 = [0.0f32; DIMS];
+        for i in 0..DIMS {
+            query_f32[i] = query_i16[i] as f32;
+        }
+
         let started_at = Instant::now();
-        let mut best_dist = [u64::MAX; K];
+        let mut best_dist = [f32::INFINITY; K];
         let mut best_label = [0u8; K];
         let mut cluster_dist = [f32::INFINITY; MAX_IVF_NPROBE];
         let mut cluster_ids = [0usize; MAX_IVF_NPROBE];
@@ -361,7 +429,7 @@ impl IvfIndex {
             visited[cluster_id] = true;
             if self.scan_cluster(
                 cluster_id,
-                distance,
+                &query_f32,
                 &mut best_dist,
                 &mut best_label,
                 started_at,
@@ -378,7 +446,7 @@ impl IvfIndex {
                     visited[cluster_id] = true;
                     if self.scan_cluster(
                         cluster_id,
-                        distance,
+                        &query_f32,
                         &mut best_dist,
                         &mut best_label,
                         started_at,
@@ -392,13 +460,15 @@ impl IvfIndex {
 
         if self.repair {
             for (cluster_id, was_visited) in visited.iter().enumerate().take(self.cluster_count) {
-                if *was_visited || self.bbox_lower_bound(&query, cluster_id) > best_dist[K - 1] {
+                if *was_visited
+                    || self.bbox_lower_bound_f32(&query_i16, cluster_id) > best_dist[K - 1]
+                {
                     continue;
                 }
 
                 if self.scan_cluster(
                     cluster_id,
-                    distance,
+                    &query_f32,
                     &mut best_dist,
                     &mut best_label,
                     started_at,
@@ -425,22 +495,24 @@ impl IvfIndex {
         total
     }
 
+    /// Block-8 SoA AVX2 scan. Computes squared L2 distance for 8 records at a
+    /// time using f32 fmadd, prunes whole blocks via _mm256_movemask_ps when no
+    /// record beats the current K-th best.
     fn scan_cluster(
         &self,
         cluster_id: usize,
-        distance: Avx2Distance,
-        best_dist: &mut [u64; K],
+        query_f32: &[f32; DIMS],
+        best_dist: &mut [f32; K],
         best_label: &mut [u8; K],
         started_at: Instant,
         deadline: Option<Duration>,
     ) -> bool {
-        let start = self.cluster_offset(cluster_id);
-        let end = self.cluster_offset(cluster_id + 1);
-        let bytes_base = self.records_offset + start * IVF_RECORD_LEN;
-        let records = &self.mmap[bytes_base..bytes_base + (end - start) * IVF_RECORD_LEN];
+        let block_start = self.cluster_block_offsets[cluster_id] as usize;
+        let block_end = self.cluster_block_offsets[cluster_id + 1] as usize;
 
-        for record_idx in 0..(end - start) {
-            if record_idx & 0x3fff == 0 {
+        for b in block_start..block_end {
+            // ~512 records between deadline checks (every 64 blocks).
+            if (b - block_start) & 0x3f == 0 {
                 if let Some(max_duration) = deadline {
                     if started_at.elapsed() > max_duration {
                         return true;
@@ -448,19 +520,36 @@ impl IvfIndex {
                 }
             }
 
-            let off = record_idx * IVF_RECORD_LEN;
-            let record = &records[off..off + IVF_RECORD_LEN];
+            let dims_off = b * BLOCK_DIMS_LEN;
+            let label_off = b * BLOCK_RECORDS;
+            let dims_ptr = unsafe { self.soa_dims.as_ptr().add(dims_off) };
+            let labels_ptr = unsafe { self.soa_labels.as_ptr().add(label_off) };
+
+            let dists_v = unsafe { block_distance_8(dims_ptr, query_f32) };
             let threshold = best_dist[K - 1];
-            let dist = unsafe {
-                squared_distance_i16_early_exit_avx2(
-                    distance.query,
-                    distance.mask,
-                    record.as_ptr(),
-                    threshold,
-                )
+            let mask_bits = unsafe {
+                let threshold_v = _mm256_set1_ps(threshold);
+                let cmp = _mm256_cmp_ps::<{ _CMP_LT_OS }>(dists_v, threshold_v);
+                _mm256_movemask_ps(cmp)
             };
-            if dist < threshold {
-                insert_best_u64(dist, record[IVF_LABEL_OFFSET], best_dist, best_label);
+            if mask_bits == 0 {
+                continue;
+            }
+
+            // Extract per-record distances and labels only when at least one
+            // record in the block can beat the current top-K. Padded slots
+            // carry distance ~1.5e10 so the mask bit for them is always 0.
+            let dists: [f32; BLOCK_RECORDS] = unsafe {
+                std::mem::transmute::<__m256, [f32; BLOCK_RECORDS]>(dists_v)
+            };
+            let labels: [u8; BLOCK_RECORDS] =
+                unsafe { std::ptr::read_unaligned(labels_ptr as *const [u8; BLOCK_RECORDS]) };
+
+            let mut bits = mask_bits as u32;
+            while bits != 0 {
+                let i = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                insert_best_f32(dists[i], labels[i], best_dist, best_label);
             }
         }
         false
@@ -472,7 +561,34 @@ impl IvfIndex {
         u64::from_le_bytes(self.mmap[offset..offset + 8].try_into().unwrap()) as usize
     }
 
+    /// f32 version of bbox_lower_bound for the post-tier-2 repair path
+    /// (only active when IVF_REPAIR=true; default off). Returns squared
+    /// distance lower bound to any point inside the cluster's AABB.
     #[inline]
+    #[allow(dead_code)]
+    fn bbox_lower_bound_f32(&self, query: &[i16; DIMS], cluster_id: usize) -> f32 {
+        let min_base = self.bbox_min_offset + cluster_id * DIMS * size_of::<i16>();
+        let max_base = self.bbox_max_offset + cluster_id * DIMS * size_of::<i16>();
+        let mut total = 0.0f32;
+        for (dim, value) in query.iter().enumerate() {
+            let mn_off = min_base + dim * size_of::<i16>();
+            let mx_off = max_base + dim * size_of::<i16>();
+            let mn = i16::from_le_bytes(self.mmap[mn_off..mn_off + 2].try_into().unwrap());
+            let mx = i16::from_le_bytes(self.mmap[mx_off..mx_off + 2].try_into().unwrap());
+            let delta: f32 = if *value < mn {
+                (mn as i32 - *value as i32) as f32
+            } else if *value > mx {
+                (*value as i32 - mx as i32) as f32
+            } else {
+                0.0
+            };
+            total += delta * delta;
+        }
+        total
+    }
+
+    #[inline]
+    #[allow(dead_code)]
     fn bbox_lower_bound(&self, query: &[i16; DIMS], cluster_id: usize) -> u64 {
         let min_base = self.bbox_min_offset + cluster_id * DIMS * size_of::<i16>();
         let max_base = self.bbox_max_offset + cluster_id * DIMS * size_of::<i16>();
@@ -619,6 +735,60 @@ fn insert_best_u64(dist: u64, label: u8, best_dist: &mut [u64; K], best_label: &
     }
     best_dist[pos] = dist;
     best_label[pos] = label;
+}
+
+#[inline(always)]
+fn insert_best_f32(dist: f32, label: u8, best_dist: &mut [f32; K], best_label: &mut [u8; K]) {
+    if dist >= best_dist[K - 1] {
+        return;
+    }
+
+    let mut pos = K - 1;
+    while pos > 0 && dist < best_dist[pos - 1] {
+        best_dist[pos] = best_dist[pos - 1];
+        best_label[pos] = best_label[pos - 1];
+        pos -= 1;
+    }
+    best_dist[pos] = dist;
+    best_label[pos] = label;
+}
+
+/// Computes squared L2 distance between query (f32, 14 dims) and 8 records
+/// laid out SoA at `dims_ptr` (block layout: dim 0 of records 0..7, dim 1 of
+/// records 0..7, ..., dim 13 of records 0..7). Returns __m256 with 8 f32
+/// distances, one per record. Uses unaligned i16 loads (one per dim) plus
+/// AVX2 widen + cvt + fmadd.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn block_distance_8(dims_ptr: *const i16, query_f32: &[f32; DIMS]) -> __m256 {
+    let mut accum = _mm256_setzero_ps();
+    // Manually unroll all 14 dims so the compiler keeps query_f32 broadcasts in
+    // registers and the diff/fmadd chain stays tight (no inner loop overhead).
+    macro_rules! step {
+        ($d:expr) => {{
+            let lane = _mm_loadu_si128(dims_ptr.add($d * BLOCK_DIM_STRIDE) as *const __m128i);
+            let lane_i32 = _mm256_cvtepi16_epi32(lane);
+            let lane_f32 = _mm256_cvtepi32_ps(lane_i32);
+            let q = _mm256_set1_ps(query_f32[$d]);
+            let diff = _mm256_sub_ps(q, lane_f32);
+            accum = _mm256_fmadd_ps(diff, diff, accum);
+        }};
+    }
+    step!(0);
+    step!(1);
+    step!(2);
+    step!(3);
+    step!(4);
+    step!(5);
+    step!(6);
+    step!(7);
+    step!(8);
+    step!(9);
+    step!(10);
+    step!(11);
+    step!(12);
+    step!(13);
+    accum
 }
 
 #[inline(always)]
@@ -837,6 +1007,56 @@ fn prefault_pages(mmap: &Mmap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_distance_8_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2")
+            || !std::is_x86_feature_detected!("fma")
+        {
+            return;
+        }
+        // 8 records, 14 dims each, contrived spread of values.
+        let records: [[i16; DIMS]; 8] = [
+            [10_000, 5_000, -1_000, 200, 30, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            [9_000, 4_000, -2_000, 300, 40, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            [-10_000, 0, 10_000, -500, 999, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [0; DIMS],
+            [1; DIMS],
+            [i16::MAX, i16::MAX, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [-32_000, 32_000, -32_000, 32_000, -32_000, 32_000, -32_000, 32_000, 0, 0, 0, 0, 0, 0],
+            [123, 456, 789, 1011, 1213, 1415, 1617, 1819, 2021, 2223, 2425, 2627, 2829, 3031],
+        ];
+        let mut block_dims = [0i16; BLOCK_DIMS_LEN];
+        for r in 0..BLOCK_RECORDS {
+            for d in 0..DIMS {
+                block_dims[d * BLOCK_DIM_STRIDE + r] = records[r][d];
+            }
+        }
+        let query: [i16; DIMS] = [
+            5_555, 2_500, 1_000, 0, 100, 4, 5, 5, 6, 7, 8, 9, 10, 11,
+        ];
+        let query_f32: [f32; DIMS] = std::array::from_fn(|i| query[i] as f32);
+
+        let dists_v = unsafe { block_distance_8(block_dims.as_ptr(), &query_f32) };
+        let actual: [f32; BLOCK_RECORDS] =
+            unsafe { std::mem::transmute::<__m256, [f32; BLOCK_RECORDS]>(dists_v) };
+
+        for r in 0..BLOCK_RECORDS {
+            let expected: f32 = (0..DIMS)
+                .map(|d| {
+                    let diff = query[d] as f32 - records[r][d] as f32;
+                    diff * diff
+                })
+                .sum();
+            // f32 has 23-bit mantissa, max distance ~1.5e10; tolerate tiny ULP error.
+            let tol = expected.abs() * 1e-4 + 1.0;
+            assert!(
+                (actual[r] - expected).abs() <= tol,
+                "record {r}: actual={actual:?}[{r}]={a} expected={expected} tol={tol}",
+                a = actual[r]
+            );
+        }
+    }
 
     #[test]
     fn avx2_i16_distance_ignores_label_lane() {
