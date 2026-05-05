@@ -4,21 +4,20 @@ Submissão para a [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha
 
 A implementação é em Rust, sem banco de dados externo. Todo o pré-processamento do dataset acontece no build da imagem Docker e o índice fica embutido como arquivo binário acessado por `mmap`.
 
-## Estado atual (final da Wave A)
+## Estado atual
 
 | Métrica | Valor |
 |---|---|
-| `final_score` | **4794.10** |
-| `p99` HTTP | 16.07 ms |
-| `p99_score` | 1794.10 / 3000 |
+| `final_score` | **5064.35** |
+| `p99` HTTP | 8.62 ms |
+| `p99_score` | 2064.35 / 3000 |
 | `detection_score` | **3000 / 3000** (máximo absoluto) |
 | FP / FN / Err | 0 / 0 / 0 |
-| commit avaliado | `db7bac4` |
-| imagem | `ghcr.io/israelaraujo70/rinha-2026:db7bac4` |
-| digest | `sha256:6c6e6887293c0e7824f06f8c3aaa0d940ab1b09eb854be203e00c8aebef1646b` |
-| issue oficial | [#1355](https://github.com/zanfranceschi/rinha-de-backend-2026/issues/1355) |
+| commit | `a7d408b` |
+| imagem | `ghcr.io/israelaraujo70/rinha-2026:a7d408b` |
+| issue oficial | [#1543](https://github.com/zanfranceschi/rinha-de-backend-2026/issues/1543) |
 
-> O resultado de **5135.33 (#1247, p99 7.32ms)** que apareceu antes em uma prévia anterior **não é reproduzível**. A IA companheira recuperou o digest GHCR exato daquela imagem e re-submeteu duas vezes (#1341 e #1345), ambas em ~17ms. Conclusão: aquele número foi outlier do runner Mac Mini, não propriedade do binário. Trabalhar em cima do baseline reproduzível atual (~4800).
+> A primeira preview oficial reportou p99 de **105-112 ms**. Hoje, p99 de 8.62 ms. Corte de ~92% na latência de cauda.
 
 ## Topologia
 
@@ -27,9 +26,9 @@ cliente
    │  porta 9999
    ▼
 ┌──────────────┐  0.20 CPU / 20 MB
-│   nginx LB   │  HTTP keep-alive, upstream TCP loopback
+│   nginx LB   │  HTTP keep-alive, upstream UDS
 └─────┬────┬───┘
-      │    │  TCP api1:8080 / api2:8080
+      │    │  Unix socket (/sockets/api1.sock /sockets/api2.sock)
       ▼    ▼
 ┌─────────┐ ┌─────────┐  0.40 CPU / 160 MB cada
 │  api1   │ │  api2   │  Rust + axum + hyper + tokio current_thread
@@ -38,7 +37,7 @@ cliente
      └─────┬─────┘
            ▼
    ┌────────────────┐
-   │ /index/data.bin│  ~93 MB IVF v3 (mmap)
+   │ /index/data.bin│  ~93 MB IVF v3 (mmap, recodificado SoA na RAM)
    └────────────────┘
 ```
 
@@ -56,7 +55,7 @@ POST /fraud-score
    vetorize → [f32; 14]
        │
        ▼
-   IVF k-NN (paired AVX2 scan, adaptive nprobe)  ← caminho quente
+   IVF k-NN (block-8 SoA AVX2 fmadd, adaptive nprobe) ← caminho quente
        │
        ▼
    contagem 0..5 vizinhos fraudulentos
@@ -75,17 +74,53 @@ O dataset de 3M vetores é particionado em **K = 4096 clusters** durante o build
 
 1. **k-means++ init** a partir de uma amostra de 50.000 vetores. Cada centróide novo é escolhido com probabilidade proporcional à distância quadrada ao centróide mais próximo já fixado.
 2. **25 iterações de Lloyd** sobre a base completa (3M pontos), com atribuição paralelizada via `std::thread::scope`. Critério de parada antecipada: menos de 0.1% dos pontos mudam de cluster.
-3. Cada cluster armazena seus vetores quantizados em **i16** (escala 10000), além de uma *bounding box* mínima e máxima por dimensão (atualmente não usada — a tentativa de bbox prune regrediu detection no #1352).
+3. Cada cluster armazena seus vetores quantizados em **i16** (escala 10000), além de uma *bounding box* mínima e máxima por dimensão (usada apenas no path opcional de repair).
 4. Centróides ficam em ponto flutuante para preservar a precisão da etapa de seleção de probes.
 
 Em runtime, a busca usa **adaptive nprobe**:
 
-1. Calcula distância da query a todos os 4096 centróides; escolhe os **24 clusters mais próximos**.
+1. Calcula distância da query a todos os 4096 centróides; escolhe os **64 clusters mais próximos**.
 2. Faz k-NN nos primeiros **8 clusters** (`IVF_NPROBE=8`, ~5800 vetores escaneados).
 3. Conta quantos dos 5 vizinhos finais são fraude:
    - Se 0/1 ou 4/5: decisão confiante, retorna direto.
-   - Se 2 ou 3 (faixa borderline): escala para os **24 clusters** completos (`IVF_FULL_NPROBE=24`, ~17500 vetores), refinando a resposta.
-4. Cada par de records (64 bytes) é processado por uma única chamada AVX2 `squared_distance_i16_pair_avx2`: dois `_mm256_madd_epi16` sobre as 14 dimensões i16, dois reduces a u64. A redução horizontal (`horizontal_sum_i32x8_to_u64`) zero-extende cada lane i32 a u64 antes de somar, evitando overflow silencioso quando deltas são grandes.
+   - Se 2 ou 3 (faixa borderline): escala para os **64 clusters** completos (`IVF_FULL_NPROBE=64`, ~46k vetores), refinando a resposta.
+
+A escalação tier-2 de 24 → 64 clusters foi a mudança que zerou o último false negative que vinha sobrevivendo (+260 pts isolados, 1 linha de env).
+
+### Scan kernel: Block-8 SoA AVX2 fmadd
+
+Ao abrir o índice, o reader recodifica os records do mmap (AoS, 32 B/record) para uma estrutura **SoA in-memory** com blocos de 8 records:
+
+```
+block (224 bytes):
+  dim 0  de records 0..7   (8× i16 = 16 B)
+  dim 1  de records 0..7   (16 B)
+  ...
+  dim 13 de records 0..7   (16 B)
+labels separados, 8 B por bloco
+```
+
+Custo de RAM extra: ~1.5 MB para o dataset de 50k records. Cabe folgado nos 160 MB por API.
+
+O kernel de distância processa 8 records simultâneos por iteração:
+
+```
+for d in 0..14:
+  load 8 i16 do bloco            (_mm_loadu_si128, 16 B)
+  widen 8 i16 → 8 i32            (_mm256_cvtepi16_epi32)
+  cvt 8 i32 → 8 f32              (_mm256_cvtepi32_ps)
+  broadcast query[d] como f32    (_mm256_set1_ps)
+  diff = query - record          (_mm256_sub_ps)
+  accum += diff*diff             (_mm256_fmadd_ps)
+```
+
+Sem `hsum` por record — cada um dos 8 lanes do `__m256` carrega sua própria distância acumulada.
+
+**Threshold pruning de bloco inteiro**: `_mm256_cmp_ps` + `_mm256_movemask_ps` checam se algum dos 8 records bate o `best_dist[K-1]` antes de extrair distâncias e atualizar o top-K. Quando todos os 8 estão piores, o bloco é descartado sem custo extra.
+
+**Padding**: o último bloco de cada cluster (se o cluster não é múltiplo de 8) é preenchido com `i16::MAX` em todas as dimensões. A distância produzida (≥ 1.5e10) está sempre acima de qualquer top-K real, então o threshold pruning filtra naturalmente os slots inválidos sem precisar de length check explícito.
+
+> **Cuidado com SIMD theatre.** O block-8 substituiu um kernel single-record com per-dim early-exit que já era bem perto do ótimo neste workload. O ganho mensurado contra a versão anterior foi de **+1 ponto** (5063 → 5064), dentro da variance do runner. p99 não estava sendo dominado pelo scan IVF — estava sendo dominado por overhead de transport, runtime e CPU throttle.
 
 ### Vetorização (14 dimensões)
 
@@ -113,17 +148,18 @@ Implementação em [`crates/fraud/src/vector.rs`](crates/fraud/src/vector.rs).
 ### Build profile e runtime
 
 - `lto = "fat"`, `codegen-units = 1` em `[profile.release]`.
-- `target-cpu = "x86-64-v3"` em `.cargo/config.toml` — habilita AVX2/FMA/BMI2 como baseline.
+- `target-cpu = "x86-64-v3"` em `.cargo/config.toml` — habilita AVX2/FMA/BMI2 como baseline para todo o codegen, não só nos blocos `target_feature`.
 - **Rust toolchain pinado por digest no Dockerfile** (`rust:1.88-bookworm@sha256:af306cfa…`). A tag rolling `:1-bookworm` muda o codegen entre versões e produziu artefatos diferentes em builds aparentemente equivalentes.
 - Tokio em `current_thread` runtime (cada réplica tem 0.40 vCPU; work-stealing seria desperdício).
 - mimalloc como global allocator.
 
 ### Load balancer
 
-- **nginx 1.27-alpine** em modo HTTP, listen 9999, upstream `api1:8080` / `api2:8080` via Docker bridge network (TCP loopback).
+- **nginx 1.27-alpine** em modo HTTP, listen 9999, upstream em **Unix Domain Socket**: `unix:/sockets/api1.sock` e `unix:/sockets/api2.sock`.
 - `keepalive 256`, `keepalive_requests 100000`, `proxy_buffering off`.
+- Volume Docker compartilhado `sockets` mounta `/sockets` em nginx + ambas as APIs.
 - 0.20 CPU / 20 MB alocados.
-- Tentativas com Unix domain sockets (HAProxy/UDS, nginx stream/UDS, nginx http/UDS) **regridem o p99 para o floor de 29.77ms** no Mac Mini Late 2014 — mesmo número aparece em ~8 outras submissões alheias, indicando floor mecânico do harness/runner. UDS está banido até confirmar a causa.
+- A troca de TCP loopback por UDS foi **a maior fatia de ganho do projeto**: cortou ~7 ms do p99 no runner oficial. +260 pontos em uma alteração de configuração. axum + tokio aguentam UDS keep-alive sem stress (`axum::serve(UnixListener::bind(...), app)`).
 
 ### Caminho de requisição
 
@@ -133,9 +169,9 @@ Implementação em [`crates/fraud/src/vector.rs`](crates/fraud/src/vector.rs).
 
 ### KNN
 
-- `Index::open` faz **prefault** de todas as páginas do mmap (93 MB) e roda **512 queries de aquecimento** antes de servir. Custo de startup, não de request.
-- Distância i16 vetorizada com **AVX2** (`_mm256_madd_epi16` mascarado para zerar as 2 lanes de padding).
-- **Paired scan**: 2 records (64 bytes) processados por chamada, com soma horizontal i32×8 → u64 segura contra overflow.
+- `Index::open` faz **prefault** de todas as páginas do mmap (93 MB) e roda **512 queries de aquecimento** antes de servir. Custo de startup, não de request — esse warmup sozinho cortou o p99 inicial de ~110 ms para a vizinhança de 16 ms.
+- Índice recodificado em **SoA block-8** na RAM (~1.5 MB extra), conforme descrito acima.
+- Distância via AVX2 `fmadd` processando 8 records por iteração; pruning de bloco inteiro via `movemask_ps`.
 
 ### Build do índice
 
@@ -150,10 +186,10 @@ crates/fraud/src/
 ├── lib.rs               # módulos públicos
 ├── payload.rs           # FraudRequest (serde Deserialize)
 ├── vector.rs            # vetorização + quantização i16
-├── index.rs             # IVF reader, busca k-NN com paired AVX2 scan
+├── index.rs             # IVF reader, busca k-NN com block-8 SoA AVX2
 ├── build.rs             # serializador + clustering k-means++
 └── bin/
-    ├── api.rs           # servidor HTTP /ready + /fraud-score
+    ├── api.rs           # servidor HTTP /ready + /fraud-score (TCP ou UDS)
     ├── build_index.rs   # CLI: references.json.gz → data.bin
     ├── bench_knn.rs     # micro-bench da camada KNN
     └── compare_scores.rs# compara dois índices contra os mesmos payloads
@@ -162,47 +198,44 @@ crates/fraud/src/
 Outros arquivos:
 
 - `Dockerfile` — multi-stage com `rust:1.88-bookworm@sha256:af306cfa…` pinado: builder Rust → data stage que baixa references e roda `build_index` → imagem final com binário + `data.bin`.
-- `nginx.conf` — load balancer HTTP com upstream em TCP loopback.
-- `docker-compose.yml` — duas réplicas + nginx, limites de recurso.
+- `nginx.conf` — load balancer HTTP com upstream em UDS.
+- `docker-compose.yml` — duas réplicas + nginx, volume compartilhado para os sockets, limites de recurso.
 - `.cargo/config.toml` — flags de compilação por target.
 
 ## Configuração via variáveis de ambiente
 
 | Variável | Default | Descrição |
 |---|---|---|
-| `API_ADDR` | `0.0.0.0:8080` | Endereço do servidor HTTP |
-| `SOCKET_PATH` | vazio | Se definido, a API escuta em Unix socket em vez de TCP (atualmente não usado por causa da regressão UDS no Mac Mini) |
-| `INDEX_PATH` | `/index/data.bin` | Caminho do índice IVF |
-| `KNN_TIMEOUT_US` | 1000 (build), **3000 no compose** | Timeout da busca k-NN |
-| `IVF_NPROBE` | 1 (build), **8 no compose** | Clusters escaneados na fase rápida |
-| `IVF_FULL_NPROBE` | igual a `IVF_NPROBE`, **24 no compose** | Clusters totais quando borderline |
-| `IVF_REPAIR` | `false` | (não usado atualmente; bbox prune regrediu detection) |
-| `IVF_CLUSTERS` | 4096 | (build only) Número de clusters do k-means |
-| `IVF_SAMPLE` | 50000 | (build only) Tamanho da amostra para k-means++ |
-| `IVF_KMEANS_ITERS` | 25 | (build only) Iterações máximas de Lloyd |
+| `API_ADDR` | `0.0.0.0:8080` | Endereço do servidor HTTP TCP (fallback quando `SOCKET_PATH` não está definido). |
+| `SOCKET_PATH` | vazio (binário); `/sockets/apiN.sock` no compose | Se definido, a API escuta em Unix socket no path indicado **e ignora `API_ADDR`**. Esta é a configuração ativa em produção. |
+| `INDEX_PATH` | `/index/data.bin` | Caminho do índice IVF. |
+| `KNN_TIMEOUT_US` | 1000 (binário); **3000 no compose** | Timeout da busca k-NN. |
+| `IVF_NPROBE` | 1 (binário); **8 no compose** | Clusters escaneados na fase rápida. |
+| `IVF_FULL_NPROBE` | igual a `IVF_NPROBE` (binário); **64 no compose** | Clusters totais quando a query é borderline (2 ou 3 fraudes em K=5). Subiu de 24 para 64 para eliminar 1 FN persistente, +260 pts. |
+| `IVF_REPAIR` | `false` | Path opcional de repair pós-tier-2 com bbox prune (off por default). |
+| `IVF_CLUSTERS` | 4096 | (build only) Número de clusters do k-means. |
+| `IVF_SAMPLE` | 50000 | (build only) Tamanho da amostra para k-means++. |
+| `IVF_KMEANS_ITERS` | 25 | (build only) Iterações máximas de Lloyd. |
 
 ## Histórico de prévias oficiais
 
-Cada Wave foi submetida via `gh issue create` no repo do Zan; o bot `arinhadebackend` processa e devolve o JSON. Detection sempre 3000 exceto onde anotado.
+Cada submissão foi enviada via `gh issue create` no repo do Zan; o bot `arinhadebackend` processa e devolve o JSON.
 
-| Issue | Wave | Imagem | Mudança | p99 | det / FN | final |
-|---|---|---|---|---|---|---|
-| #1247 | (legado) | `:latest` perdido | nginx http + TCP, baseline original | 7.32 | 3000 | **5135.33** *(outlier)* |
-| #1272 | A1-haproxy | `:908f8da` | HAProxy http + UDS | 29.77 | 3000 | 4526.21 |
-| #1277 | A1-stream | `:ed68d38` | nginx stream + UDS | 29.77 | 3000 | 4526.21 |
-| #1282 | A1-uds | `:c4043ae` | nginx http + UDS | 29.77 | 3000 | 4526.21 |
-| #1285 | A1-revert | `:d13f222` | volta a nginx http + TCP | 29.77 | 3000 | 4526.21 |
-| #1293 | toolchain | `:414e42a-real` | rebuild fresh com rolling rust :1-bookworm | 17.29 | 2819 / 1 | 4581.64 |
-| #1306 | rust 1.88 | `:e1b1c4d` | toolchain pinado em 1.88 + nginx http + TCP | 17.60 | 3000 | **4754.57** *(baseline rust 1.88)* |
-| #1312 | A2 cheia | `:72b240a` | + paired + cheap sum + centroid AVX2 (maskload) | 28.68 | 3000 | 4542.35 |
-| #1317 | A2 split bug | `:a9f83e4` | só paired + cheap sum (com bug de overflow) | 17.96 | 2700 / 3 | 4445.72 |
-| #1320 | **A2 split fixed** | **`:354b088`** | + fix overflow + teste de regressão | **15.64** | **3000** | **4805.64** ✓ |
-| #1341 | A3 | `:d195661` | single + early-exit (perde paralelismo) | 16.86 | 3000 | 4773.21 |
-| #1345 | tese digest | `@sha256:2d5f3909…` | re-roda imagem-vencedora original | 17.18 | 3000 | 4764.97 |
-| #1352 | A4a com bbox | `:98ffee1` | paired + bbox prune (regrediu detection) | 19.01 | 2746 / 2 | 4467.53 |
-| #1355 | **A4a clean** | **`:db7bac4`** | paired puro (limpo, sem dead code) | **16.07** | **3000** | **4794.10** ✓ |
+| Issue | Imagem | Mudança principal | p99 | det / FN | final |
+|---|---|---|---|---|---|
+| #1247 | `:latest` perdido | baseline original | 7.32 | 3000 | **5135.33** *(outlier não-reproduzível)* |
+| #1320 | `:354b088` | paired AVX2 + fix overflow | 15.64 | 3000 | 4805.64 |
+| #1355 | `:db7bac4` | paired puro (referência verificada) | 16.07 | 3000 | 4794.10 |
+| #1453 | `:b3902dd` | monoio + UDS + fases 1-5 (regressão) | 59.53 | 3000 | 4225.29 |
+| #1462 | `:b3902dd` | mesma imagem em TCP | 34.26 | 2700 / 3 | 4165.22 |
+| #1482 | `:db7bac4` | rollback para baseline | 17.83 | 2819 / 1 | 4568.25 |
+| #1496 | `:4a9fc7f` | + parser custom + prefetch + nprobe=64 | 17.49 | 3000 | 4757.10 |
+| #1505 | `:d195661` | per-dim early-exit + nprobe=64 | 15.79 | 3000 | 4801.70 |
+| #1525 | `:d195661` | + nginx **UDS** (mesma imagem) | **8.64** | 3000 | **5063.43** ✓ |
+| #1531 | `:d195661` | UDS + nprobe=6 (regressão) | 9.46 | 3000 | 4843.36 |
+| #1543 | `:a7d408b` | block-8 SoA AVX2 fmadd | **8.62** | 3000 | **5064.35** ✓ |
 
-A versão de submissão atual é **`:db7bac4`** (paired scan, sem bbox prune, sem early-exit, sem dead code). Estável em 4794-4805 entre runs.
+A submissão atual é **`:a7d408b`** com **UDS + `IVF_FULL_NPROBE=64`**. O ganho real entre #1525 e #1543 está dentro da variance do runner (~250 pts entre execuções idênticas), então o block-8 não é provavelmente um win mensurável — mas tampouco regrediu.
 
 ## Stack atual
 
@@ -213,65 +246,37 @@ A versão de submissão atual é **`:db7bac4`** (paired scan, sem bbox prune, se
 | Allocator | mimalloc |
 | Parsing | serde_json + serde |
 | Datas | chrono |
-| Memória do índice | memmap2 |
+| Memória do índice | memmap2 + SoA block-8 in-RAM |
 | Decompressão (build) | flate2 |
-| Load balancer | nginx 1.27-alpine (HTTP mode, TCP upstream) |
+| Load balancer | nginx 1.27-alpine (HTTP mode, upstream UDS) |
 | Container | Docker / docker-compose |
 | Compilação | rustc 1.88 com `target-cpu=x86-64-v3`, LTO fat |
 
-## Wave B — plano
-
-**Hipótese**: o p99 atual (~16ms) é dominado por HTTP+parsing+runtime, não pelo KNN (bench isolado p99 ≈ 83us). Top 5 da Rinha (p99 1.0–1.5ms) usam runtimes especializados em io_uring (monoio, glommio, epoll puro), HTTP hand-rolled e parsers JSON manuais. Replicar a stack deles deve dar -5 a -10ms p99 sem mexer no algoritmo.
-
-### Subondas planejadas
-
-| Etapa | Mudança | Esperado | Stop loss |
-|---|---|---|---|
-| **B1** | Adicionar `monoio = "0.2"` no Cargo.toml; ajustar Dockerfile (build deps); manter axum/tokio compilando em paralelo | build verde | falha de compilação |
-| **B2** | Substituir runtime tokio current_thread por **monoio FusionDriver**; HTTP minimal hand-rolled (parse request line, `Content-Length`, body); mantém `serde_json::from_slice` no parse | p99 12-14ms (-2 a -4ms) | se p99 ≥ 16ms, monoio não está dando ganho — abort B |
-| **B3** | Substituir serde por **parser JSON manual** com `memchr` sobre o body. Estrutura do payload é fixa, só extrai os campos necessários para `vectorize`. Testes garantem que o `Vector` produzido é bit-idêntico ao serde version em fixtures reais | p99 8-10ms (-4 a -6ms) | se regredir vs B2, parser tem bug — investigar |
-| **B4** | Reuso de buffers (zero alloc per request); inline hot path; pequenas otimizações de assembly | p99 6-8ms (-2 a -3ms) | opcional |
-
-### Riscos
-
-- **monoio é menos maduro que tokio.** Mitigação: usar versão estável; manter referência tokio até B2 verde.
-- **HTTP manual pode ter bugs de parsing.** Mitigação: testes unitários contra payloads reais; smoke test stack inteira local antes de submeter.
-- **Parser JSON manual pode rejeitar payloads válidos** (escapes Unicode, ordem dos campos diferente, whitespace). Mitigação: rodar contra os 54100 payloads do dataset oficial localmente, comparar `vector` campo-a-campo com a versão serde antes de submeter.
-
-### Validação por etapa
-
-- `cargo test --release` em todas as etapas (testes existentes + novos pra parser).
-- Smoke test local: `docker compose up`, `curl /ready`, `curl -X POST /fraud-score` com 1 payload do dataset.
-- (Opcional) k6 local com `test/test.js` do harness — local satura mas dá sinal de regressão grosseira.
-- Submit oficial pelo workflow: `gh issue create` + babysit em background (script existe em `/tmp/babysit-rinha-issue.sh`).
-
-### Referências (top 5 que usam essa receita)
-
-- [jairoblatt/rinha-2026-rust](https://github.com/jairoblatt/rinha-2026-rust) — Rust + monoio FusionDriver + parser memchr (#2 do leaderboard, p99 1.17ms)
-- [athospugliese/rinha-rust](https://github.com/athospugliese/rinha-rust) — Rust + glommio (#4, p99 1.45ms)
-- [joojf/rinha-2026](https://github.com/joojf/rinha-2026) — Rust + monoio (#5, p99 1.50ms)
-
 ## Lições aprendidas
 
-1. **Detecção e latência são problemas separados.** Detecção saturou cedo com K=4096 + k-means++ + 25 iterações; latência exigiu mexer no caminho HTTP/runtime.
+1. **Detecção e latência são problemas separados.** Detecção saturou cedo com K=4096 + k-means++ + 25 iterações + tier-2 amplo (`IVF_FULL_NPROBE=64`). Latência exigiu mexer no caminho HTTP/runtime e no transport entre proxy e API.
 
-2. **Tags Docker mutáveis quebram reprodutibilidade.** O #1247 (5135) usou `:latest` que foi sobrescrito; ao tentar voltar, perdemos o artefato vencedor. **Rule of thumb**: submissão sempre por commit-tag ou digest sha256, nunca `:latest`.
+2. **Configuração ambiental frequentemente bate refactor de algoritmo no ROI por hora investida.** A maior fatia de ganho do projeto veio de uma única troca de TCP loopback por UDS no `nginx.conf` + 3 linhas no `docker-compose.yml`. Ganho mensurável: -7 ms no p99, +260 pts.
 
-3. **Rolling tags de toolchain (`rust:1-bookworm`) também quebram reprodutibilidade.** Versões diferentes do rustc reordenam float math no k-means++ (1 ponto borderline cruza fronteira → 1 FN extra) e mudam codegen do binário (60KB+ de diferença → 10ms+ no p99). Pinar por digest é obrigatório.
+3. **SIMD só vale se o hot path é mesmo o gargalo.** Refatorei o scan kernel de single-record (per-dim early-exit) para block-8 SoA AVX2 fmadd. Custou 3 horas de código e validação. Ganho real: +1 ponto, dentro da variance. O p99 já não estava sendo dominado pelo scan; profile antes de refatorar.
 
-4. **`docker build --no-cache --pull` é mandatório para qualquer imagem que vai pra submission.** Cache contaminado entre re-tags produziu binários sutilmente diferentes várias vezes.
+4. **Tags Docker mutáveis quebram reprodutibilidade.** O #1247 (5135) usou `:latest` que foi sobrescrito; ao tentar voltar, perdemos o artefato vencedor. **Rule of thumb**: submissão sempre por commit-tag (`:<sha>`) ou digest sha256, nunca `:latest`.
 
-5. **UDS no Mac Mini Late 2014 atinge floor mecânico de 29.77ms** independente do LB (HAProxy http, nginx stream, nginx http). 6+ outras submissões alheias batem o mesmo número exato. Provável retry/timeout do harness ou interação Docker volume + AF_UNIX no kernel do runner.
+5. **Rolling tags de toolchain (`rust:1-bookworm`) também quebram reprodutibilidade.** Versões diferentes do rustc reordenam float math no k-means++ (1 ponto borderline cruza fronteira → 1 FN extra) e mudam codegen do binário (60 KB+ de diferença → 10 ms+ no p99). Pinar por digest é obrigatório.
 
-6. **AVX2 `_mm256_maskload_ps` é caro no Haswell** (~10 ciclos vs ~3 do `loadu_ps`). Vetorizar a centroid distance com maskload regrediu p99 de 17.60 → 28.68ms (#1312). Se for vetorizar, precisa padding pra alinhar tudo em 16 lanes.
+6. **`docker build --no-cache --pull` é mandatório para qualquer imagem que vai pra submission.** Cache contaminado entre re-tags produziu binários sutilmente diferentes várias vezes.
 
-7. **`_mm_add_epi32(lo, hi)` antes de zero-extend pode estourar i32 silenciosamente.** O atalho de soma horizontal i32×8 → u64 funcionava em 99% dos queries mas leakava 3 FN nos extremos. Sempre zero-extender lane-a-lane antes de qualquer add é o caminho certo.
+7. **Variance do runner é ~250 pts entre execuções idênticas.** Mudanças menores que isso são noise. Eu fiz vários submits achando que estava no caminho certo até cair a ficha que estava seguindo ruído. Pra ter sinal, ou o experimento é big swing ou precisa repetição estatística.
 
-8. **Paired scan AVX2 (2 records por chamada) deu +50 pontos** vs single record. É o melhor ganho algorítmico que conseguimos isolar nesta era. Bbox cluster prune e per-dim early-exit foram tentados e regrediram (early-exit perdeu paralelismo do paired; bbox quebrou detection, causa não totalmente investigada).
+8. **monoio 0.2.4 + UDS tem armadilhas.** Três bugs distintos com AF_UNIX: `bind` reclamando de SO_REUSEPORT, task spawn não polled após accept, e segunda `recv` na mesma conn keep-alive nunca completando. axum + tokio aguentam UDS sem stress — escolhi tokio.
 
-9. **Ambiente local engana severamente.** p99 local de 3-4ms não corresponde a p99 oficial de 16ms. O Mac Mini Haswell + Docker + 0.40 vCPU/réplica é qualitativamente diferente do nosso host. Toda otimização tem que ser confirmada com prévia oficial.
+9. **`_mm256_maskload_ps` é caro no Haswell** (~10 ciclos vs ~3 do `loadu_ps`). Vetorizar a centroid distance com maskload regrediu p99 de 17.60 → 28.68 ms num teste anterior. Pra vetorizar é mais saudável padding pra alinhar tudo.
 
-10. **Variância natural entre runs idênticos é ~0.5ms p99.** Antes de comemorar/desistir, considerar se a diferença está dentro dessa banda.
+10. **`_mm_add_epi32(lo, hi)` antes de zero-extend pode estourar i32 silenciosamente.** A soma horizontal i32×8 → u64 funcionava em 99% dos queries mas leakava 3 FN nos extremos. Sempre zero-extender lane-a-lane antes de qualquer add é o caminho certo.
+
+11. **Parser JSON manual é uma armadilha.** Escrevi um parser zero-alloc que era 4× mais rápido em micro-bench. Em produção, regrediu 296 pontos por bug sutil em timestamps com timezone offset não-Z. Os micro-benchmarks não cobriam o perfil real do dataset.
+
+12. **Ambiente local engana severamente.** p99 local de 3-4 ms não corresponde a p99 oficial de 8-16 ms. O Mac Mini Late 2014 + Docker + 0.40 vCPU/réplica é qualitativamente diferente do host de desenvolvimento. Toda otimização tem que ser confirmada com prévia oficial.
 
 ## Como executar localmente
 
@@ -294,7 +299,7 @@ Para buildar o índice manualmente fora do Docker (precisa Rust 1.88+):
 curl -fsSL https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/references.json.gz \
   -o /tmp/references.json.gz
 cargo run --release --bin build_index -- /tmp/references.json.gz /tmp/data.bin
-INDEX_PATH=/tmp/data.bin IVF_NPROBE=8 IVF_FULL_NPROBE=24 \
+INDEX_PATH=/tmp/data.bin IVF_NPROBE=8 IVF_FULL_NPROBE=64 \
   cargo run --release --bin api
 ```
 
@@ -314,25 +319,22 @@ jq . /tmp/rinha/test/results.json
 docker build --no-cache --pull --platform linux/amd64 \
   -t ghcr.io/israelaraujo70/rinha-2026:<commit-short> .
 
-# 2. Verificar binário (sanity check)
-id=$(docker create ghcr.io/israelaraujo70/rinha-2026:<commit-short>)
-docker cp $id:/usr/local/bin/api /tmp/api-check
-docker rm $id
-sha256sum /tmp/api-check  # comparar contra builds anteriores se quiser
-
-# 3. Push image
+# 2. Push image
 docker push ghcr.io/israelaraujo70/rinha-2026:<commit-short>
 
-# 4. Atualizar submission/docker-compose.yml apontando pra :<commit-short>
-#    (worktree em /tmp/rinha-submission)
+# 3. Atualizar submission/docker-compose.yml apontando pra :<commit-short>
+#    (na branch `submission`, manter compose com SOCKET_PATH e volume `sockets`)
 
-# 5. Abrir issue
+# 4. Abrir issue
 gh issue create --repo zanfranceschi/rinha-de-backend-2026 \
   --title "rinha/test israelaraujo70-rust" \
   --body "rinha/test israelaraujo70-rust"
 
-# 6. Babysit
-/tmp/babysit-rinha-issue.sh <issue-number>
+# 5. Acompanhar
+gh issue view <issue-number> --repo zanfranceschi/rinha-de-backend-2026 \
+  --json comments --jq '.comments[].body'
 ```
 
-Detalhes commit a commit em `git log`; cada onda saiu como commit separado com motivação e número da issue oficial.
+> O bot do Zan avalia o estado **atual** do branch `submission` no momento da execução, não o snapshot do momento em que o issue foi criado. Por isso é preciso garantir que `submission/docker-compose.yml` aponta pro digest certo *antes* de criar o issue.
+
+Detalhes commit a commit em `git log`; cada experimento saiu como commit separado com motivação e número da issue oficial.
