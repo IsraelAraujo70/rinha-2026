@@ -18,7 +18,7 @@ services:
           memory: "20MB"
 
   api1:
-    image: ghcr.io/israelaraujo70/rinha-2026:db7bac4
+    image: ghcr.io/israelaraujo70/rinha-2026:94009a0
     platform: linux/amd64
     environment:
       API_ADDR: 0.0.0.0:8080
@@ -34,7 +34,7 @@ services:
           memory: "160MB"
 
   api2:
-    image: ghcr.io/israelaraujo70/rinha-2026:db7bac4
+    image: ghcr.io/israelaraujo70/rinha-2026:94009a0
     platform: linux/amd64
     environment:
       API_ADDR: 0.0.0.0:8080
