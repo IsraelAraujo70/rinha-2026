@@ -451,6 +451,18 @@ impl IvfIndex {
             }
 
             let off = idx * IVF_RECORD_LEN;
+            // Prefetch the pair 4 records ahead (~128 B = 2 cache lines).
+            // mmap-backed records are random-access here; this hides L2 misses
+            // when the cluster fits in L3 but not L2.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let prefetch_off = off + IVF_RECORD_LEN * 4;
+                if prefetch_off < records.len() {
+                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                        records.as_ptr().add(prefetch_off) as *const i8,
+                    );
+                }
+            }
             let pair = &records[off..off + IVF_RECORD_LEN * 2];
             let [d0, d1] =
                 unsafe { squared_distance_i16_pair_avx2(distance.query, distance.mask, pair) };

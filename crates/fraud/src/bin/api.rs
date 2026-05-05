@@ -11,9 +11,8 @@ use axum::{
     Router,
 };
 use fraud::{
+    fast_parse::parse_and_vectorize,
     index::{Index, SearchResult},
-    payload::FraudRequest,
-    vector::vectorize,
 };
 use mimalloc::MiMalloc;
 use tracing::{error, info, warn};
@@ -104,36 +103,21 @@ async fn ready() -> impl IntoResponse {
 }
 
 async fn fraud_score(State(state): State<AppState>, body: Bytes) -> Response {
-    let request = match serde_json::from_slice::<FraudRequest>(&body) {
-        Ok(request) => request,
-        Err(err) => {
-            error!(error = %err, "invalid payload; using approve fallback");
+    let vector = match parse_and_vectorize(&body) {
+        Some(v) => v,
+        None => {
+            error!("invalid payload; using approve fallback");
             return json_response(FRAUD_FALLBACK);
         }
     };
-
-    json_response(score_request(&state, &request))
-}
-
-fn score_request(state: &AppState, request: &FraudRequest) -> &'static [u8] {
-    match score_count(state, request) {
-        Some(count) => FRAUD_RESPONSES[count],
-        None => FRAUD_FALLBACK,
-    }
-}
-
-fn score_count(state: &AppState, request: &FraudRequest) -> Option<usize> {
-    let vector = vectorize(request);
-    let fraud_score = match state.index.fraud_score(&vector, Some(state.knn_timeout)) {
-        SearchResult::Score(score) => score,
+    let count = match state.index.fraud_score(&vector, Some(state.knn_timeout)) {
+        SearchResult::Score(score) => ((score * 5.0).round() as usize).min(5),
         SearchResult::TimedOut => {
-            warn!(id = %request.id, "knn timed out; using approve fallback");
-            return None;
+            warn!("knn timed out; using approve fallback");
+            return json_response(FRAUD_FALLBACK);
         }
     };
-
-    let count = (fraud_score * 5.0).round() as usize;
-    Some(count.min(5))
+    json_response(FRAUD_RESPONSES[count])
 }
 
 fn json_response(body: &'static [u8]) -> Response {
