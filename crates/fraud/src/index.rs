@@ -359,15 +359,6 @@ impl IvfIndex {
         let mut visited = [false; MAX_IVF_CLUSTERS];
         for &cluster_id in &cluster_ids[..self.nprobe] {
             visited[cluster_id] = true;
-            // bbox prune: skip cluster if its tightest possible squared distance
-            // already exceeds the current worst-of-top5. Free for the very first
-            // cluster (best_dist[K-1] == u64::MAX, prune never triggers); pays
-            // off as the threshold tightens after each insert.
-            if best_dist[K - 1] != u64::MAX
-                && self.bbox_lower_bound(&query, cluster_id) > best_dist[K - 1]
-            {
-                continue;
-            }
             if self.scan_cluster(
                 cluster_id,
                 distance,
@@ -385,9 +376,6 @@ impl IvfIndex {
             if frauds == 2 || frauds == 3 {
                 for &cluster_id in &cluster_ids[self.nprobe..max_probes] {
                     visited[cluster_id] = true;
-                    if self.bbox_lower_bound(&query, cluster_id) > best_dist[K - 1] {
-                        continue;
-                    }
                     if self.scan_cluster(
                         cluster_id,
                         distance,
