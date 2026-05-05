@@ -3,13 +3,15 @@ compile_error!("this implementation targets linux/amd64 only");
 
 use std::{
     arch::x86_64::{
-        __m128i, __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_broadcastsi128_si256,
-        _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
-        _mm256_set_epi16, _mm256_set_epi8, _mm256_setzero_si256, _mm256_sub_epi16,
-        _mm256_unpackhi_epi8, _mm256_unpacklo_epi8, _mm_add_epi32, _mm_add_epi64, _mm_and_si128,
-        _mm_cvtsi128_si32, _mm_cvtsi128_si64, _mm_loadu_si128, _mm_madd_epi16, _mm_set_epi8,
-        _mm_setzero_si128, _mm_srli_si128, _mm_sub_epi16, _mm_unpackhi_epi32, _mm_unpackhi_epi64,
-        _mm_unpackhi_epi8, _mm_unpacklo_epi32, _mm_unpacklo_epi8,
+        __m128, __m128i, __m256, __m256i, _mm256_add_epi32, _mm256_add_ps, _mm256_and_si256,
+        _mm256_broadcastsi128_si256, _mm256_castps256_ps128, _mm256_castsi256_si128,
+        _mm256_extractf128_ps, _mm256_extracti128_si256, _mm256_loadu_ps, _mm256_loadu_si256,
+        _mm256_madd_epi16, _mm256_mul_ps, _mm256_set_epi16, _mm256_set_epi8, _mm256_setzero_si256,
+        _mm256_sub_epi16, _mm256_sub_ps, _mm256_unpackhi_epi8, _mm256_unpacklo_epi8, _mm_add_epi32,
+        _mm_add_epi64, _mm_add_ps, _mm_add_ss, _mm_and_si128, _mm_cvtsi128_si32, _mm_cvtsi128_si64,
+        _mm_cvtss_f32, _mm_loadu_si128, _mm_madd_epi16, _mm_movehdup_ps, _mm_movehl_ps,
+        _mm_set_epi8, _mm_setzero_si128, _mm_srli_si128, _mm_sub_epi16, _mm_unpackhi_epi32,
+        _mm_unpackhi_epi64, _mm_unpackhi_epi8, _mm_unpacklo_epi32, _mm_unpacklo_epi8,
     },
     env,
     fs::File,
@@ -57,12 +59,17 @@ struct IvfIndex {
     nprobe: usize,
     full_nprobe: usize,
     repair: bool,
-    centroids_offset: usize,
     offsets_offset: usize,
     bbox_min_offset: usize,
     bbox_max_offset: usize,
     records_offset: usize,
+    centroids_aligned: Vec<CentroidBlock>,
 }
+
+// 14 dims + 2 zero-pad lanes; align(32) so AVX `_mm256_load_ps` is legal.
+#[repr(align(32))]
+#[derive(Clone, Copy)]
+struct CentroidBlock([f32; 16]);
 
 #[derive(Clone, Copy)]
 struct Avx2Distance {
@@ -182,6 +189,17 @@ impl Index {
         let full_nprobe =
             env_usize("IVF_FULL_NPROBE", nprobe).clamp(nprobe, cluster_count.min(MAX_IVF_NPROBE));
         let repair = env_bool("IVF_REPAIR", false);
+
+        let mut centroids_aligned = vec![CentroidBlock([0.0; 16]); cluster_count];
+        for cluster_id in 0..cluster_count {
+            let base = centroids_offset + cluster_id * DIMS * size_of::<f32>();
+            let block = &mut centroids_aligned[cluster_id].0;
+            for dim in 0..DIMS {
+                let off = base + dim * size_of::<f32>();
+                block[dim] = f32::from_le_bytes(mmap[off..off + 4].try_into().unwrap());
+            }
+        }
+
         Ok(Self {
             inner: IndexInner::Ivf(IvfIndex {
                 mmap,
@@ -190,11 +208,11 @@ impl Index {
                 nprobe,
                 full_nprobe,
                 repair,
-                centroids_offset,
                 offsets_offset,
                 bbox_min_offset,
                 bbox_max_offset,
                 records_offset,
+                centroids_aligned,
             }),
         })
     }
@@ -345,8 +363,16 @@ impl IvfIndex {
         let mut cluster_ids = [0usize; MAX_IVF_NPROBE];
 
         let max_probes = self.full_nprobe;
+        let mut q_pad = [0.0f32; 16];
+        q_pad[..DIMS].copy_from_slice(vector);
+        let (q_lo, q_hi) = unsafe {
+            (
+                _mm256_loadu_ps(q_pad.as_ptr()),
+                _mm256_loadu_ps(q_pad.as_ptr().add(8)),
+            )
+        };
         for cluster_id in 0..self.cluster_count {
-            let dist = self.centroid_distance(vector, cluster_id);
+            let dist = unsafe { self.centroid_distance_avx2(q_lo, q_hi, cluster_id) };
             insert_best_cluster(
                 dist,
                 cluster_id,
@@ -413,16 +439,21 @@ impl IvfIndex {
     }
 
     #[inline]
-    fn centroid_distance(&self, vector: &Vector, cluster_id: usize) -> f32 {
-        let base = self.centroids_offset + cluster_id * DIMS * size_of::<f32>();
-        let mut total = 0.0;
-        for (dim, value) in vector.iter().enumerate() {
-            let offset = base + dim * size_of::<f32>();
-            let centroid = f32::from_le_bytes(self.mmap[offset..offset + 4].try_into().unwrap());
-            let delta = *value - centroid;
-            total += delta * delta;
-        }
-        total
+    #[target_feature(enable = "avx2")]
+    unsafe fn centroid_distance_avx2(
+        &self,
+        q_lo: __m256,
+        q_hi: __m256,
+        cluster_id: usize,
+    ) -> f32 {
+        let block = self.centroids_aligned.as_ptr().add(cluster_id) as *const f32;
+        let c_lo = _mm256_loadu_ps(block);
+        let c_hi = _mm256_loadu_ps(block.add(8));
+        let d_lo = _mm256_sub_ps(q_lo, c_lo);
+        let d_hi = _mm256_sub_ps(q_hi, c_hi);
+        let s_lo = _mm256_mul_ps(d_lo, d_lo);
+        let s_hi = _mm256_mul_ps(d_hi, d_hi);
+        horizontal_sum_ps(_mm256_add_ps(s_lo, s_hi))
     }
 
     fn scan_cluster(
@@ -574,6 +605,19 @@ unsafe fn squared_distance_pair_avx2(
         horizontal_sum_i32x4(_mm256_castsi256_si128(sums)),
         horizontal_sum_i32x4(_mm256_extracti128_si256::<1>(sums)),
     ]
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn horizontal_sum_ps(v: __m256) -> f32 {
+    let lo: __m128 = _mm256_castps256_ps128(v);
+    let hi: __m128 = _mm256_extractf128_ps::<1>(v);
+    let s = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(s);
+    let sums = _mm_add_ps(s, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let final_ = _mm_add_ss(sums, shuf2);
+    _mm_cvtss_f32(final_)
 }
 
 #[target_feature(enable = "sse2")]
@@ -835,7 +879,7 @@ mod tests {
             return;
         }
         let query: [i16; 14] = [32000; 14];
-        let mut candidate = [0u8; IVF_RECORD_LEN];
+        let candidate = [0u8; IVF_RECORD_LEN];
         // candidate vector is all zeros — squared diffs = 32000^2 per dim.
         let distance = unsafe {
             squared_distance_i16_avx2(
@@ -862,4 +906,57 @@ mod tests {
         assert_eq!(pair_dist, [expected, expected]);
     }
 
+    #[test]
+    fn centroid_distance_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let query: Vector = [
+            0.10, 0.25, 0.07, 0.78, 0.33, 0.50, 0.05, 0.02, 0.15, 1.00, 1.00, 0.00, 0.15, 0.006,
+        ];
+        let centroids: [[f32; DIMS]; 4] = [
+            [0.0; DIMS],
+            [1.0; DIMS],
+            [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+            query,
+        ];
+
+        let mut blocks: Vec<CentroidBlock> = centroids
+            .iter()
+            .map(|c| {
+                let mut b = CentroidBlock([0.0; 16]);
+                b.0[..DIMS].copy_from_slice(c);
+                b
+            })
+            .collect();
+        // Build a minimal IvfIndex shell whose only used field is centroids_aligned.
+        // Avoid constructing a real Mmap: use a one-byte file via a tempfile.
+        let mut q_pad = [0.0f32; 16];
+        q_pad[..DIMS].copy_from_slice(&query);
+
+        for (cluster_id, c) in centroids.iter().enumerate() {
+            let scalar: f32 = query
+                .iter()
+                .zip(c.iter())
+                .map(|(q, c)| (q - c).powi(2))
+                .sum();
+            let avx = unsafe {
+                let block = blocks.as_ptr().add(cluster_id) as *const f32;
+                let q_lo = _mm256_loadu_ps(q_pad.as_ptr());
+                let q_hi = _mm256_loadu_ps(q_pad.as_ptr().add(8));
+                let c_lo = _mm256_loadu_ps(block);
+                let c_hi = _mm256_loadu_ps(block.add(8));
+                let d_lo = _mm256_sub_ps(q_lo, c_lo);
+                let d_hi = _mm256_sub_ps(q_hi, c_hi);
+                let s = _mm256_add_ps(_mm256_mul_ps(d_lo, d_lo), _mm256_mul_ps(d_hi, d_hi));
+                horizontal_sum_ps(s)
+            };
+            assert!(
+                (scalar - avx).abs() <= 1e-5_f32.max(scalar.abs() * 1e-5),
+                "cluster {cluster_id}: scalar={scalar} avx={avx}"
+            );
+        }
+        // Touch blocks so MIRI / lints accept the read pattern.
+        std::hint::black_box(&mut blocks);
+    }
 }
