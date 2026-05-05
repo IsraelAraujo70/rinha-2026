@@ -526,14 +526,19 @@ impl IvfIndex {
             let max_offset = max_base + dim * size_of::<i16>();
             let min = i16::from_le_bytes(self.mmap[min_offset..min_offset + 2].try_into().unwrap());
             let max = i16::from_le_bytes(self.mmap[max_offset..max_offset + 2].try_into().unwrap());
-            let delta = if *value < min {
-                min as i32 - *value as i32
+            // Compute |delta| in u32: branch puts us on the side where the
+            // subtraction is non-negative, so the cast is well-defined.
+            // delta can reach 65_535 (i16::MAX - i16::MIN), so squaring in
+            // i32 would overflow; do the squaring in u64.
+            let delta: u32 = if *value < min {
+                (min as i32 - *value as i32) as u32
             } else if *value > max {
-                *value as i32 - max as i32
+                (*value as i32 - max as i32) as u32
             } else {
                 0
             };
-            total += (delta * delta) as u64;
+            let delta = delta as u64;
+            total += delta * delta;
         }
         total
     }
@@ -910,6 +915,41 @@ mod tests {
         };
         let _ = candidate;
         assert_eq!(pair_dist, [expected, expected]);
+    }
+
+    #[test]
+    fn bbox_lower_bound_handles_large_deltas() {
+        use crate::build::build_ivf_index_from_json_reader;
+        use std::io::Cursor;
+
+        // Two records, both with extreme i16-quantized coords on opposite ends.
+        // After build, the bbox of the assigned cluster will span i16::MIN..i16::MAX
+        // for several dims, and a query at the opposite extreme produces deltas
+        // > 46341 — the threshold where i32 squaring would overflow.
+        let payload = br#"[
+          {"vector":[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0],"label":"legit"},
+          {"vector":[-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0],"label":"fraud"}
+        ]"#;
+
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        std::env::set_var("IVF_CLUSTERS", "1");
+        let _ = build_ivf_index_from_json_reader(Cursor::new(&payload[..]), &mut buf);
+        std::env::remove_var("IVF_CLUSTERS");
+        let bytes = buf.into_inner();
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("fraud-bbox-overflow.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        let index = Index::open(&path).unwrap();
+
+        // Query is well-clamped; whatever lower bound the bbox computes must
+        // not be a wrap-around bogus huge u64.
+        let query: Vector = [0.5; DIMS];
+        match index.fraud_score(&query, None) {
+            SearchResult::Score(_) => {}
+            SearchResult::TimedOut => panic!("unexpected timeout without deadline"),
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
