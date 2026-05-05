@@ -449,6 +449,17 @@ impl IvfIndex {
             }
 
             let off = record_idx * IVF_RECORD_LEN;
+            // Prefetch the record 4 ahead (~128 B = 2 cache lines). mmap-backed
+            // record data may sit in L3 but not L2 when scanning a hot cluster.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let prefetch_off = off + IVF_RECORD_LEN * 4;
+                if prefetch_off < records.len() {
+                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                        records.as_ptr().add(prefetch_off) as *const i8,
+                    );
+                }
+            }
             let record = &records[off..off + IVF_RECORD_LEN];
             let threshold = best_dist[K - 1];
             let dist = unsafe {
