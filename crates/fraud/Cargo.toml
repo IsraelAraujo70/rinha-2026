@@ -6,13 +6,10 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-axum.workspace = true
 chrono.workspace = true
 flate2.workspace = true
 memmap2.workspace = true
 mimalloc.workspace = true
+monoio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true

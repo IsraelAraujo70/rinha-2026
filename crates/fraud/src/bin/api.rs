@@ -1,91 +1,57 @@
-use std::{
-    env, net::SocketAddr, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration,
-};
+use std::{env, path::PathBuf, time::Duration};
 
-use axum::{
-    body::Bytes,
-    extract::State,
-    http::{header, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-    Router,
-};
 use fraud::{
     index::{Index, SearchResult},
     payload::FraudRequest,
     vector::vectorize,
 };
 use mimalloc::MiMalloc;
-use tracing::{error, info, warn};
+use monoio::{
+    buf::SliceMut,
+    io::{AsyncReadRent, AsyncWriteRentExt},
+    net::{TcpListener, TcpStream},
+};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-#[derive(Clone)]
-struct AppState {
-    index: Arc<Index>,
-    knn_timeout: Duration,
-}
-
 const DEFAULT_KNN_TIMEOUT_US: u64 = 1_000;
 
 const FRAUD_RESPONSES: [&[u8]; 6] = [
-    b"{\"approved\":true,\"fraud_score\":0.0}",
-    b"{\"approved\":true,\"fraud_score\":0.2}",
-    b"{\"approved\":true,\"fraud_score\":0.4}",
-    b"{\"approved\":false,\"fraud_score\":0.6}",
-    b"{\"approved\":false,\"fraud_score\":0.8}",
-    b"{\"approved\":false,\"fraud_score\":1.0}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}",
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}",
 ];
 const FRAUD_FALLBACK: &[u8] = FRAUD_RESPONSES[0];
+const READY_RESPONSE: &[u8] = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
+fn main() -> anyhow::Result<()> {
     let index_path = env::var_os("INDEX_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/index/data.bin"));
-    let index = Arc::new(Index::open(&index_path)?);
-    info!(path = %index_path.display(), records = index.len(), "index loaded");
+    let index: &'static Index = Box::leak(Box::new(Index::open(&index_path)?));
+    let knn_timeout = configured_timeout();
 
-    let state = AppState {
-        index,
-        knn_timeout: configured_timeout(),
-    };
-    let app = Router::new()
-        .route("/ready", get(ready))
-        .route("/fraud-score", post(fraud_score))
-        .with_state(state);
+    let addr_str = env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let addr: std::net::SocketAddr = addr_str.parse()?;
 
-    serve(app).await
-}
-
-async fn serve(app: Router) -> anyhow::Result<()> {
-    if let Some(socket_path) = env::var_os("SOCKET_PATH").map(PathBuf::from) {
-        if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+        .with_entries(256)
+        .build()?;
+    rt.block_on(async move {
+        let listener = TcpListener::bind(addr).expect("bind");
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    monoio::spawn(handle_connection(stream, index, knn_timeout));
+                }
+                Err(_) => continue,
+            }
         }
-        let _ = std::fs::remove_file(&socket_path);
-        let listener = tokio::net::UnixListener::bind(&socket_path)?;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))?;
-        info!(path = %socket_path.display(), "api listening on unix socket");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
-        return Ok(());
-    }
-
-    let addr: SocketAddr = env::var("API_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
-        .parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(%addr, "api listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    });
     Ok(())
 }
 
@@ -99,68 +65,151 @@ fn configured_timeout() -> Duration {
     )
 }
 
-async fn ready() -> impl IntoResponse {
-    StatusCode::NO_CONTENT
-}
+async fn handle_connection(mut stream: TcpStream, index: &'static Index, knn_timeout: Duration) {
+    let _ = stream.set_nodelay(true);
+    let mut buf: Vec<u8> = vec![0u8; 8192];
+    let mut filled: usize = 0;
 
-async fn fraud_score(State(state): State<AppState>, body: Bytes) -> Response {
-    let request = match serde_json::from_slice::<FraudRequest>(&body) {
-        Ok(request) => request,
-        Err(err) => {
-            error!(error = %err, "invalid payload; using approve fallback");
-            return json_response(FRAUD_FALLBACK);
+    loop {
+        let head_end = loop {
+            if let Some(end) = find_headers_end(&buf[..filled]) {
+                break end + 4;
+            }
+            if filled == buf.len() {
+                buf.resize(buf.len() * 2, 0);
+            }
+            let cap = buf.len();
+            let slice = unsafe { SliceMut::new_unchecked(buf, filled, cap) };
+            let (res, returned) = stream.read(slice).await;
+            buf = returned.into_inner();
+            match res {
+                Ok(0) => return,
+                Ok(n) => filled += n,
+                Err(_) => return,
+            }
+        };
+
+        let (method, content_len) = parse_request_head(&buf[..head_end - 4]);
+
+        let consumed = if method == Method::Post {
+            let total = head_end + content_len;
+            if total > buf.len() {
+                buf.resize(total, 0);
+            }
+            while filled < total {
+                let slice = unsafe { SliceMut::new_unchecked(buf, filled, total) };
+                let (res, returned) = stream.read(slice).await;
+                buf = returned.into_inner();
+                match res {
+                    Ok(0) => return,
+                    Ok(n) => filled += n,
+                    Err(_) => return,
+                }
+            }
+            let body = &buf[head_end..total];
+            let response = score_body(index, knn_timeout, body);
+            let (res, _) = stream.write_all(response).await;
+            if res.is_err() {
+                return;
+            }
+            total
+        } else {
+            let (res, _) = stream.write_all(READY_RESPONSE).await;
+            if res.is_err() {
+                return;
+            }
+            head_end
+        };
+
+        if consumed < filled {
+            buf.copy_within(consumed..filled, 0);
         }
-    };
-
-    json_response(score_request(&state, &request))
-}
-
-fn score_request(state: &AppState, request: &FraudRequest) -> &'static [u8] {
-    match score_count(state, request) {
-        Some(count) => FRAUD_RESPONSES[count],
-        None => FRAUD_FALLBACK,
+        filled -= consumed;
     }
 }
 
-fn score_count(state: &AppState, request: &FraudRequest) -> Option<usize> {
-    let vector = vectorize(request);
-    let fraud_score = match state.index.fraud_score(&vector, Some(state.knn_timeout)) {
-        SearchResult::Score(score) => score,
-        SearchResult::TimedOut => {
-            warn!(id = %request.id, "knn timed out; using approve fallback");
-            return None;
-        }
-    };
+#[inline]
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 4 {
+        return None;
+    }
+    memchr_end(buf)
+}
 
+#[inline]
+fn memchr_end(buf: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    let end = buf.len().saturating_sub(3);
+    while i < end {
+        if buf[i] == b'\r'
+            && buf[i + 1] == b'\n'
+            && buf[i + 2] == b'\r'
+            && buf[i + 3] == b'\n'
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[derive(PartialEq, Eq)]
+enum Method {
+    Post,
+    Other,
+}
+
+fn parse_request_head(headers: &[u8]) -> (Method, usize) {
+    let method = if headers.starts_with(b"POST ") {
+        Method::Post
+    } else {
+        Method::Other
+    };
+    let content_len = find_content_length(headers).unwrap_or(0);
+    (method, content_len)
+}
+
+fn find_content_length(headers: &[u8]) -> Option<usize> {
+    const NEEDLE: &[u8] = b"Content-Length:";
+    let mut i = 0;
+    while i + NEEDLE.len() <= headers.len() {
+        let slice = &headers[i..i + NEEDLE.len()];
+        let matches = slice == NEEDLE
+            || (slice.len() == NEEDLE.len()
+                && slice
+                    .iter()
+                    .zip(NEEDLE.iter())
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b)));
+        if matches {
+            let mut j = i + NEEDLE.len();
+            while j < headers.len() && (headers[j] == b' ' || headers[j] == b'\t') {
+                j += 1;
+            }
+            let mut val: usize = 0;
+            let mut any_digit = false;
+            while j < headers.len() && headers[j].is_ascii_digit() {
+                val = val * 10 + (headers[j] - b'0') as usize;
+                any_digit = true;
+                j += 1;
+            }
+            return any_digit.then_some(val);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[inline]
+fn score_body(index: &Index, knn_timeout: Duration, body: &[u8]) -> &'static [u8] {
+    let request = match serde_json::from_slice::<FraudRequest>(body) {
+        Ok(r) => r,
+        Err(_) => return FRAUD_FALLBACK,
+    };
+    let vector = vectorize(&request);
+    let fraud_score = match index.fraud_score(&vector, Some(knn_timeout)) {
+        SearchResult::Score(s) => s,
+        SearchResult::TimedOut => return FRAUD_FALLBACK,
+    };
     let count = (fraud_score * 5.0).round() as usize;
-    Some(count.min(5))
-}
-
-fn json_response(body: &'static [u8]) -> Response {
-    let mut response = Response::new(axum::body::Body::from(Bytes::from_static(body)));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    response
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
+    FRAUD_RESPONSES[count.min(5)]
 }
