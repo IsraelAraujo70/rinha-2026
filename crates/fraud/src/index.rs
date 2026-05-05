@@ -3,12 +3,16 @@ compile_error!("this implementation targets linux/amd64 only");
 
 use std::{
     arch::x86_64::{
-        __m128i, __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_broadcastsi128_si256,
-        _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
-        _mm256_set_epi16, _mm256_set_epi8, _mm256_setzero_si256, _mm256_storeu_si256,
-        _mm256_sub_epi16, _mm256_unpackhi_epi8, _mm256_unpacklo_epi8, _mm_add_epi32, _mm_and_si128,
-        _mm_cvtsi128_si32, _mm_loadu_si128, _mm_madd_epi16, _mm_set_epi8, _mm_setzero_si128,
-        _mm_srli_si128, _mm_sub_epi16, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+        __m128i, __m256, __m256i, _mm256_add_epi32, _mm256_add_ps, _mm256_and_si256,
+        _mm256_broadcastsi128_si256, _mm256_castps256_ps128, _mm256_castsi256_si128,
+        _mm256_extractf128_ps, _mm256_extracti128_si256, _mm256_loadu_ps, _mm256_loadu_si256,
+        _mm256_madd_epi16, _mm256_maskload_ps, _mm256_mul_ps, _mm256_set_epi16, _mm256_set_epi32,
+        _mm256_set_epi8, _mm256_setzero_si256, _mm256_sub_epi16,
+        _mm256_sub_ps, _mm256_unpackhi_epi8, _mm256_unpacklo_epi8, _mm_add_epi32, _mm_add_epi64,
+        _mm_add_ps, _mm_and_si128, _mm_cvtsi128_si32, _mm_cvtsi128_si64, _mm_cvtss_f32,
+        _mm_loadu_si128, _mm_madd_epi16, _mm_movehl_ps, _mm_set_epi8, _mm_setzero_si128,
+        _mm_shuffle_ps, _mm_srli_si128, _mm_sub_epi16, _mm_unpackhi_epi32, _mm_unpackhi_epi64,
+        _mm_unpackhi_epi8, _mm_unpacklo_epi32, _mm_unpacklo_epi8,
     },
     env,
     fs::File,
@@ -67,6 +71,13 @@ struct IvfIndex {
 struct Avx2Distance {
     query: __m256i,
     mask: __m256i,
+}
+
+#[derive(Clone, Copy)]
+struct Avx2Centroid {
+    lo: __m256,
+    hi: __m256,
+    hi_mask: __m256i,
 }
 
 pub enum SearchResult {
@@ -337,6 +348,7 @@ impl IvfIndex {
             query: unsafe { load_query_i16_avx2(&query) },
             mask: unsafe { distance_mask_i16_avx2() },
         };
+        let centroid = unsafe { Self::load_centroid_query(vector) };
         let started_at = Instant::now();
         let mut best_dist = [u64::MAX; K];
         let mut best_label = [0u8; K];
@@ -345,7 +357,7 @@ impl IvfIndex {
 
         let max_probes = self.full_nprobe;
         for cluster_id in 0..self.cluster_count {
-            let dist = self.centroid_distance(vector, cluster_id);
+            let dist = unsafe { self.centroid_distance_avx2(centroid, cluster_id) };
             insert_best_cluster(
                 dist,
                 cluster_id,
@@ -412,16 +424,32 @@ impl IvfIndex {
     }
 
     #[inline]
-    fn centroid_distance(&self, vector: &Vector, cluster_id: usize) -> f32 {
-        let base = self.centroids_offset + cluster_id * DIMS * size_of::<f32>();
-        let mut total = 0.0;
-        for (dim, value) in vector.iter().enumerate() {
-            let offset = base + dim * size_of::<f32>();
-            let centroid = f32::from_le_bytes(self.mmap[offset..offset + 4].try_into().unwrap());
-            let delta = *value - centroid;
-            total += delta * delta;
-        }
-        total
+    #[target_feature(enable = "avx2")]
+    unsafe fn load_centroid_query(vector: &Vector) -> Avx2Centroid {
+        // 14 dims: 8 in lo (lanes 0..8), 6 in hi (lanes 0..6, lanes 6..8 masked off).
+        // hi_mask zeroes out lanes 6 and 7 of the upper f32x8.
+        let lo = _mm256_loadu_ps(vector.as_ptr());
+        let hi_mask = _mm256_set_epi32(0, 0, -1, -1, -1, -1, -1, -1);
+        let hi = _mm256_maskload_ps(vector.as_ptr().add(8), hi_mask);
+        Avx2Centroid { lo, hi, hi_mask }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn centroid_distance_avx2(&self, query: Avx2Centroid, cluster_id: usize) -> f32 {
+        let base = self
+            .mmap
+            .as_ptr()
+            .add(self.centroids_offset + cluster_id * DIMS * size_of::<f32>())
+            .cast::<f32>();
+        let c_lo = _mm256_loadu_ps(base);
+        let c_hi = _mm256_maskload_ps(base.add(8), query.hi_mask);
+        let d_lo = _mm256_sub_ps(query.lo, c_lo);
+        let d_hi = _mm256_sub_ps(query.hi, c_hi);
+        let sq_lo = _mm256_mul_ps(d_lo, d_lo);
+        let sq_hi = _mm256_mul_ps(d_hi, d_hi);
+        let sums = _mm256_add_ps(sq_lo, sq_hi);
+        horizontal_sum_f32x8(sums)
     }
 
     fn scan_cluster(
@@ -435,8 +463,13 @@ impl IvfIndex {
     ) -> bool {
         let start = self.cluster_offset(cluster_id);
         let end = self.cluster_offset(cluster_id + 1);
-        for record_idx in start..end {
-            if record_idx & 0x3fff == 0 {
+        let bytes_base = self.records_offset + start * IVF_RECORD_LEN;
+        let records = &self.mmap[bytes_base..bytes_base + (end - start) * IVF_RECORD_LEN];
+
+        let mut idx = 0usize;
+        let pair_count = (end - start) & !1;
+        while idx < pair_count {
+            if idx & 0x3fff == 0 {
                 if let Some(max_duration) = deadline {
                     if started_at.elapsed() > max_duration {
                         return true;
@@ -444,8 +477,23 @@ impl IvfIndex {
                 }
             }
 
-            let record_offset = self.records_offset + record_idx * IVF_RECORD_LEN;
-            let record = &self.mmap[record_offset..record_offset + IVF_RECORD_LEN];
+            let off = idx * IVF_RECORD_LEN;
+            let pair = &records[off..off + IVF_RECORD_LEN * 2];
+            let [d0, d1] =
+                unsafe { squared_distance_i16_pair_avx2(distance.query, distance.mask, pair) };
+            insert_best_u64(d0, pair[IVF_LABEL_OFFSET], best_dist, best_label);
+            insert_best_u64(
+                d1,
+                pair[IVF_RECORD_LEN + IVF_LABEL_OFFSET],
+                best_dist,
+                best_label,
+            );
+            idx += 2;
+        }
+
+        if idx < end - start {
+            let off = idx * IVF_RECORD_LEN;
+            let record = &records[off..off + IVF_RECORD_LEN];
             let dist = unsafe { squared_distance_i16_avx2(distance.query, distance.mask, record) };
             insert_best_u64(dist, record[IVF_LABEL_OFFSET], best_dist, best_label);
         }
@@ -650,9 +698,64 @@ unsafe fn squared_distance_i16_avx2(query: __m256i, mask: __m256i, candidate: &[
     );
     let diff = _mm256_sub_epi16(query, candidate);
     let sums = _mm256_madd_epi16(diff, diff);
-    let mut lanes = [0i32; 8];
-    _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), sums);
-    lanes.iter().map(|lane| *lane as u32 as u64).sum()
+    horizontal_sum_i32x8_to_u64(sums)
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn squared_distance_i16_pair_avx2(
+    query: __m256i,
+    mask: __m256i,
+    pair_bytes: &[u8],
+) -> [u64; 2] {
+    // pair_bytes layout: 2 IVF records (32 bytes each) back-to-back = 64 bytes.
+    let cand0 = _mm256_and_si256(
+        _mm256_loadu_si256(pair_bytes.as_ptr().cast::<__m256i>()),
+        mask,
+    );
+    let cand1 = _mm256_and_si256(
+        _mm256_loadu_si256(pair_bytes.as_ptr().add(IVF_RECORD_LEN).cast::<__m256i>()),
+        mask,
+    );
+    let diff0 = _mm256_sub_epi16(query, cand0);
+    let diff1 = _mm256_sub_epi16(query, cand1);
+    let sums0 = _mm256_madd_epi16(diff0, diff0);
+    let sums1 = _mm256_madd_epi16(diff1, diff1);
+    [
+        horizontal_sum_i32x8_to_u64(sums0),
+        horizontal_sum_i32x8_to_u64(sums1),
+    ]
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn horizontal_sum_i32x8_to_u64(sums: __m256i) -> u64 {
+    // sums = 8 i32 lanes, each non-negative (squared diffs).
+    // Per-lane max is roughly 2*(2*10000)^2 ≈ 8e8, so two lanes summed still
+    // fit i32 (1.6e9 < 2^31). Reduce 8 -> 4, then zero-extend to u64 to avoid
+    // overflow when summing all four (worst case 8e8 * 4 ≈ 3.2e9 > u32).
+    let lo = _mm256_castsi256_si128(sums);
+    let hi = _mm256_extracti128_si256::<1>(sums);
+    let s4 = _mm_add_epi32(lo, hi);
+    let zero = _mm_setzero_si128();
+    let lo_u64 = _mm_unpacklo_epi32(s4, zero);
+    let hi_u64 = _mm_unpackhi_epi32(s4, zero);
+    let combined = _mm_add_epi64(lo_u64, hi_u64);
+    let upper = _mm_unpackhi_epi64(combined, zero);
+    let final_sum = _mm_add_epi64(combined, upper);
+    _mm_cvtsi128_si64(final_sum) as u64
+}
+
+#[inline]
+#[target_feature(enable = "avx")]
+unsafe fn horizontal_sum_f32x8(value: __m256) -> f32 {
+    let lo = _mm256_castps256_ps128(value);
+    let hi = _mm256_extractf128_ps::<1>(value);
+    let sum4 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehl_ps(sum4, sum4);
+    let sum2 = _mm_add_ps(sum4, shuf);
+    let shuf2 = _mm_shuffle_ps::<0b01_01_01_01>(sum2, sum2);
+    let sum1 = _mm_add_ps(sum2, shuf2);
+    _mm_cvtss_f32(sum1)
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
