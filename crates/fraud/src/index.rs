@@ -702,19 +702,23 @@ unsafe fn squared_distance_i16_pair_avx2(
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn horizontal_sum_i32x8_to_u64(sums: __m256i) -> u64 {
-    // sums = 8 i32 lanes, each non-negative (squared diffs).
-    // Per-lane max is roughly 2*(2*10000)^2 ≈ 8e8, so two lanes summed still
-    // fit i32 (1.6e9 < 2^31). Reduce 8 -> 4, then zero-extend to u64 to avoid
-    // overflow when summing all four (worst case 8e8 * 4 ≈ 3.2e9 > u32).
+    // sums = 8 i32 lanes, each non-negative (squared diffs from madd).
+    // Per-lane max ≈ 2*(2*10000)^2 ≈ 8e8 fits i32, but adjacent-lane sums can
+    // reach 1.6e9 (still i32-safe) and the four-lane reduction can hit 3.2e9
+    // which overflows i32 signed. Zero-extend to u64 BEFORE any add to keep
+    // the running total exact in all cases.
     let lo = _mm256_castsi256_si128(sums);
     let hi = _mm256_extracti128_si256::<1>(sums);
-    let s4 = _mm_add_epi32(lo, hi);
     let zero = _mm_setzero_si128();
-    let lo_u64 = _mm_unpacklo_epi32(s4, zero);
-    let hi_u64 = _mm_unpackhi_epi32(s4, zero);
-    let combined = _mm_add_epi64(lo_u64, hi_u64);
-    let upper = _mm_unpackhi_epi64(combined, zero);
-    let final_sum = _mm_add_epi64(combined, upper);
+    let lo_a = _mm_unpacklo_epi32(lo, zero); // [lo[0], lo[1]] as 2× u64
+    let lo_b = _mm_unpackhi_epi32(lo, zero); // [lo[2], lo[3]] as 2× u64
+    let hi_a = _mm_unpacklo_epi32(hi, zero); // [hi[0], hi[1]] as 2× u64
+    let hi_b = _mm_unpackhi_epi32(hi, zero); // [hi[2], hi[3]] as 2× u64
+    let s1 = _mm_add_epi64(lo_a, lo_b);
+    let s2 = _mm_add_epi64(hi_a, hi_b);
+    let s3 = _mm_add_epi64(s1, s2);
+    let upper = _mm_unpackhi_epi64(s3, zero);
+    let final_sum = _mm_add_epi64(s3, upper);
     _mm_cvtsi128_si64(final_sum) as u64
 }
 
@@ -821,5 +825,40 @@ mod tests {
             .sum::<u64>();
 
         assert_eq!(distance, expected);
+    }
+
+    #[test]
+    fn horizontal_sum_handles_i32_overflow() {
+        // Each madd lane near i32 max; total > 2^31 to force a wrap if any
+        // intermediate add stayed in i32.
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let query: [i16; 14] = [32000; 14];
+        let mut candidate = [0u8; IVF_RECORD_LEN];
+        // candidate vector is all zeros — squared diffs = 32000^2 per dim.
+        let distance = unsafe {
+            squared_distance_i16_avx2(
+                load_query_i16_avx2(&query),
+                distance_mask_i16_avx2(),
+                &candidate,
+            )
+        };
+        let expected: u64 = (0..DIMS as u64).map(|_| (32_000i64 * 32_000i64) as u64).sum();
+        assert_eq!(distance, expected);
+
+        // Same value through the paired path.
+        let mut pair = [0u8; IVF_RECORD_LEN * 2];
+        pair[..IVF_RECORD_LEN].copy_from_slice(&candidate);
+        pair[IVF_RECORD_LEN..].copy_from_slice(&candidate);
+        let pair_dist = unsafe {
+            squared_distance_i16_pair_avx2(
+                load_query_i16_avx2(&query),
+                distance_mask_i16_avx2(),
+                &pair,
+            )
+        };
+        let _ = candidate;
+        assert_eq!(pair_dist, [expected, expected]);
     }
 }
