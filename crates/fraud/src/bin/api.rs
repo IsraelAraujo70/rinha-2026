@@ -89,15 +89,25 @@ where
     S: AsyncReadRent + AsyncWriteRentExt,
 {
     let mut buf: Vec<u8> = vec![0u8; 8192];
+    let mut start: usize = 0;
     let mut filled: usize = 0;
 
     loop {
+        // Find end of request headers, reading more bytes into `buf` until we see the
+        // CRLFCRLF marker. Two-cursor layout: `start..filled` holds the unparsed slice
+        // of the current keep-alive cycle.
         let head_end = loop {
-            if let Some(end) = find_headers_end(&buf[..filled]) {
-                break end + 4;
+            if let Some(rel) = find_headers_end(&buf[start..filled]) {
+                break start + rel + 4;
             }
             if filled == buf.len() {
-                buf.resize(buf.len() * 2, 0);
+                if start > 0 {
+                    buf.copy_within(start..filled, 0);
+                    filled -= start;
+                    start = 0;
+                } else {
+                    buf.resize(buf.len() * 2, 0);
+                }
             }
             let cap = buf.len();
             let slice = unsafe { SliceMut::new_unchecked(buf, filled, cap) };
@@ -110,15 +120,16 @@ where
             }
         };
 
-        let (method, content_len) = parse_request_head(&buf[..head_end - 4]);
+        let (method, content_len) = parse_request_head(&buf[start..head_end - 4]);
 
-        let consumed = if method == Method::Post {
+        let next_start = if method == Method::Post {
             let total = head_end + content_len;
             if total > buf.len() {
                 buf.resize(total, 0);
             }
             while filled < total {
-                let slice = unsafe { SliceMut::new_unchecked(buf, filled, total) };
+                let cap = buf.len();
+                let slice = unsafe { SliceMut::new_unchecked(buf, filled, cap) };
                 let (res, returned) = stream.read(slice).await;
                 buf = returned.into_inner();
                 match res {
@@ -142,10 +153,12 @@ where
             head_end
         };
 
-        if consumed < filled {
-            buf.copy_within(consumed..filled, 0);
+        if next_start == filled {
+            start = 0;
+            filled = 0;
+        } else {
+            start = next_start;
         }
-        filled -= consumed;
     }
 }
 
