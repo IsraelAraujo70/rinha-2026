@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM rust:1.80-bookworm@sha256:d22d8938f0403ee31c118b5bf2162b883313dd7f387f859d9f2accd7c884c385 AS builder
+FROM --platform=$BUILDPLATFORM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
 
 WORKDIR /app
 COPY Cargo.toml ./
