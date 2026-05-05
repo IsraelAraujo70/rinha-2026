@@ -8,7 +8,7 @@ use mimalloc::MiMalloc;
 use monoio::{
     buf::SliceMut,
     io::{AsyncReadRent, AsyncWriteRentExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, UnixListener},
 };
 
 #[global_allocator]
@@ -34,23 +34,43 @@ fn main() -> anyhow::Result<()> {
     let index: &'static Index = Box::leak(Box::new(Index::open(&index_path)?));
     let knn_timeout = configured_timeout();
 
-    let addr_str = env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    let addr: std::net::SocketAddr = addr_str.parse()?;
+    let uds_path = env::var_os("API_UDS_PATH").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty());
 
     let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
         .with_entries(256)
         .build()?;
-    rt.block_on(async move {
-        let listener = TcpListener::bind(addr).expect("bind");
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    monoio::spawn(handle_connection(stream, index, knn_timeout));
+
+    if let Some(path) = uds_path {
+        let _ = std::fs::remove_file(&path);
+        rt.block_on(async move {
+            let listener = UnixListener::bind(&path).expect("bind unix");
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        monoio::spawn(handle_connection(stream, index, knn_timeout));
+                    }
+                    Err(_) => continue,
                 }
-                Err(_) => continue,
             }
-        }
-    });
+        });
+    } else {
+        let addr_str = env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+        let addr: std::net::SocketAddr = addr_str.parse()?;
+        rt.block_on(async move {
+            let listener = TcpListener::bind(addr).expect("bind");
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let _ = stream.set_nodelay(true);
+                        monoio::spawn(handle_connection(stream, index, knn_timeout));
+                    }
+                    Err(_) => continue,
+                }
+            }
+        });
+    }
     Ok(())
 }
 
@@ -64,8 +84,10 @@ fn configured_timeout() -> Duration {
     )
 }
 
-async fn handle_connection(mut stream: TcpStream, index: &'static Index, knn_timeout: Duration) {
-    let _ = stream.set_nodelay(true);
+async fn handle_connection<S>(mut stream: S, index: &'static Index, knn_timeout: Duration)
+where
+    S: AsyncReadRent + AsyncWriteRentExt,
+{
     let mut buf: Vec<u8> = vec![0u8; 8192];
     let mut filled: usize = 0;
 
